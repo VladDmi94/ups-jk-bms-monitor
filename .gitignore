@@ -1,0 +1,25 @@
+# Go build artifacts
+/bin/
+/build/
+/dist/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Test and profiling output
+coverage.txt
+coverage.html
+*.prof
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# IDE and operating system files
+.idea/
+.DS_Store
+Thumbs.db
