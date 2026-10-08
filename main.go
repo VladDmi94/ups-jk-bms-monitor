@@ -1,7 +1,8 @@
 package main
 
 import (
-	"encoding/hex"
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"strings"
@@ -10,7 +11,6 @@ import (
 	"tinygo.org/x/bluetooth"
 )
 
-// Целевое имя или MAC вашей BMS
 const TargetBMSName = "60126310241"
 const TargetBMSAddress = "C8:47:80:53:5E:04"
 
@@ -19,11 +19,20 @@ var (
 	charUUID, _    = bluetooth.ParseUUID("0000ffe1-0000-1000-8000-00805f9b34fb")
 )
 
-// Запрос кадра телеметрии JK02/JK04
-var requestFrame = []byte{
-	0xAA, 0x55, 0x90, 0xEB, 0x97, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x11,
+var headerResponseMagic = []byte{0x55, 0xAA, 0xEB, 0x90}
+
+type BMSData struct {
+	DeviceModel  string
+	HardwareVer  string
+	SoftwareVer  string
+	TotalVoltage float64
+	Current      float64
+	SOC          uint8
+	TempMOS      float64
+	Temp1        float64
+	Temp2        float64
+	Cells        []float64
+	HasTelemetry bool
 }
 
 var adapter = bluetooth.DefaultAdapter
@@ -43,32 +52,24 @@ func main() {
 		name := result.LocalName()
 		addr := result.Address.String()
 
-		// Проверяем совпадение по имени или MAC-адресу
 		if name == TargetBMSName || strings.EqualFold(addr, TargetBMSAddress) {
-			fmt.Printf("\n[УСПЕХ] Найдена JK BMS! Name: %s | Address: %s\n", name, addr)
+			fmt.Printf("[УСПЕХ] Найдена JK BMS! Name: %s | Address: %s\n", name, addr)
 			targetDevice = result
 			found = true
 			adapter.StopScan()
 		}
 	})
 
-	if err != nil {
-		log.Fatalf("Ошибка сканирования: %v", err)
+	if err != nil || !found {
+		log.Fatalf("Устройство не найдено.")
 	}
 
-	if !found {
-		log.Fatal("Устройство не найдено в зоне видимости BLE.")
-	}
-
-	// Подключение к BMS
 	fmt.Printf("Подключение к %s...\n", targetDevice.Address.String())
 	device, err := adapter.Connect(targetDevice.Address, bluetooth.ConnectionParams{})
 	if err != nil {
 		log.Fatalf("Не удалось подключиться: %v", err)
 	}
 	defer device.Disconnect()
-
-	fmt.Println("Подключено! Поиск сервиса FFE0...")
 
 	services, err := device.DiscoverServices([]bluetooth.UUID{serviceUUID})
 	if err != nil || len(services) == 0 {
@@ -81,63 +82,227 @@ func main() {
 	}
 
 	bmsChar := chars[0]
-
-	// Буфер для сборки кадра
-	rxBuffer := make([]byte, 0, 500)
+	rxBuffer := make([]byte, 0, 2048)
+	var finalData BMSData
 
 	err = bmsChar.EnableNotifications(func(buf []byte) {
 		rxBuffer = append(rxBuffer, buf...)
-		fmt.Printf("-> Чанк BLE (%d байт), итого в буфере: %d байт\n", len(buf), len(rxBuffer))
-
-		// Ищем заголовок кадра 55 AA EB 90
-		if len(rxBuffer) >= 273 {
-			fmt.Println("\n==========================================")
-			fmt.Println("   ПОЛУЧЕН ПОЛНЫЙ КАДР ОТ JK BD4A8S4P")
-			fmt.Println("==========================================")
-			fmt.Println("Первые 32 байта (HEX):", hex.EncodeToString(rxBuffer[:min(32, len(rxBuffer))]))
-
-			parseBasicInfo(rxBuffer)
-			fmt.Println("==========================================")
-		}
+		rxBuffer = processJKBuffer(rxBuffer, &finalData)
 	})
 
 	if err != nil {
-		log.Fatalf("Ошибка включения Notifications: %v", err)
+		log.Fatalf("Ошибка подписки на уведомления: %v", err)
 	}
 
-	// Отправляем командный запрос кадра
-	fmt.Println("Отправка запроса телеметрии в характеристику FFE1...")
-	_, err = bmsChar.WriteWithoutResponse(requestFrame)
-	if err != nil {
-		log.Fatalf("Ошибка записи в FFE1: %v", err)
+	time.Sleep(500 * time.Millisecond)
+
+	// 1. Сначала запрашиваем Device Info (0x97)
+	cmd97 := buildJKCommand(0x97)
+	fmt.Println("Отправка запроса Device Info (0x97)...")
+	if _, err := bmsChar.WriteWithoutResponse(cmd97); err != nil {
+		log.Fatalf("Ошибка отправки 0x97: %v", err)
 	}
 
-	// Ждем данные 6 секунд
-	time.Sleep(6 * time.Second)
-	fmt.Println("\nТестовый прогон завершен.")
-}
+	time.Sleep(700 * time.Millisecond)
 
-func parseBasicInfo(frame []byte) {
-	i := 11
-	for i < len(frame)-4 {
-		tag := frame[i]
-		switch tag {
-		case 0x83: // Total Voltage (2 байта, Big-Endian, unit = 0.01V)
-			vRaw := uint16(frame[i+1])<<8 | uint16(frame[i+2])
-			fmt.Printf(" Напряжение АКБ : %.2f V\n", float64(vRaw)/100.0)
-			i += 3
-		case 0x85: // SOC (1 байт, %)
-			fmt.Printf(" Заряд (SOC)     : %d%%\n", frame[i+1])
-			i += 2
-		default:
-			i++
+	// 2. Затем запрашиваем Status/Telemetry (0x96) с повтором при необходимости
+	for attempt := 1; attempt <= 8; attempt++ {
+		cmd96 := buildJKCommand(0x96)
+		fmt.Printf("Отправка запроса Status (0x96), попытка %d/8...\n", attempt)
+		if _, err := bmsChar.WriteWithoutResponse(cmd96); err != nil {
+			log.Printf("Ошибка отправки 0x96: %v", err)
+		}
+
+		for i := 0; i < 10; i++ {
+			if finalData.HasTelemetry {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		if finalData.HasTelemetry {
+			break
 		}
 	}
+
+	if finalData.HasTelemetry || finalData.DeviceModel != "" {
+		printBMSReport(finalData)
+	} else {
+		fmt.Printf("\n[!] Ответ не получен. Накоплено байт в буфере: %d\n", len(rxBuffer))
+	}
+
+	fmt.Println("\nТест завершён.")
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
+func buildJKCommand(cmdType byte) []byte {
+	cmd := make([]byte, 20)
+	cmd[0] = 0xAA
+	cmd[1] = 0x55
+	cmd[2] = 0x90
+	cmd[3] = 0xEB
+	cmd[4] = cmdType
+
+	var sum byte = 0
+	for i := 0; i < 19; i++ {
+		sum += cmd[i]
 	}
-	return b
+	cmd[19] = sum
+	return cmd
+}
+
+func processJKBuffer(buf []byte, outData *BMSData) []byte {
+	const frameSize = 300
+
+	for {
+		idx := bytes.Index(buf, headerResponseMagic)
+
+		if idx == -1 {
+			if len(buf) > 3 {
+				return append([]byte(nil), buf[len(buf)-3:]...)
+			}
+			return buf
+		}
+
+		if idx > 0 {
+			buf = buf[idx:]
+		}
+
+		if len(buf) < frameSize {
+			return buf
+		}
+
+		frame := buf[:frameSize]
+
+		var crc byte
+		for _, b := range frame[:299] {
+			crc += b
+		}
+
+		if crc != frame[299] {
+			log.Printf("[RX] Ошибка CRC: calculated=0x%02X received=0x%02X", crc, frame[299])
+			buf = buf[1:]
+			continue
+		}
+
+		frameType := frame[4]
+		counter := frame[5]
+
+		log.Printf("[RX] Frame 0x%02X, counter=0x%02X, CRC OK", frameType, counter)
+
+		switch frameType {
+		case 0x01:
+			log.Printf("[RX] Получен Frame 0x01 (settings)")
+
+		case 0x02:
+			parseTelemetryFrame(frame, outData)
+			outData.HasTelemetry = true
+			log.Printf("[RX] Telemetry: %.3f V, %.3f A, %d%%, %d cells",
+				outData.TotalVoltage, outData.Current, outData.SOC, len(outData.Cells))
+
+		case 0x03:
+			parseInfoFrame(frame, outData)
+
+		default:
+			log.Printf("[RX] Неизвестный Frame type: 0x%02X", frameType)
+		}
+
+		buf = buf[frameSize:]
+	}
+}
+
+func parseInfoFrame(frame []byte, data *BMSData) {
+	if len(frame) < 38 {
+		return
+	}
+
+	data.DeviceModel = strings.Trim(string(frame[6:22]), "\x00 ")
+	data.HardwareVer = strings.Trim(string(frame[22:30]), "\x00 ")
+	data.SoftwareVer = strings.Trim(string(frame[30:38]), "\x00 ")
+
+	log.Printf("[INFO] Model=%s HW=%s SW=%s", data.DeviceModel, data.HardwareVer, data.SoftwareVer)
+}
+
+func parseTelemetryFrame(frame []byte, data *BMSData) {
+	if len(frame) < 300 {
+		return
+	}
+
+	const cellOffset = 16
+	const dataOffset = 32
+
+	// Определяем количество активных ячеек из битовой маски
+	cellMask := binary.LittleEndian.Uint32(frame[54+cellOffset : 58+cellOffset])
+	cellCount := 0
+
+	for i := 0; i < 32; i++ {
+		if (cellMask & (1 << i)) != 0 {
+			cellCount = i + 1
+		}
+	}
+
+	if cellCount == 0 {
+		cellCount = 8 // Дефолт для BD4A8S4P (8S)
+	}
+	if cellCount > 32 {
+		cellCount = 32
+	}
+
+	// Чтение напряжений ячеек (0.001 V, uint16 Little-Endian)
+	data.Cells = make([]float64, 0, cellCount)
+	for i := 0; i < cellCount; i++ {
+		pos := 6 + cellOffset + i*2
+		raw := binary.LittleEndian.Uint16(frame[pos : pos+2])
+		data.Cells = append(data.Cells, float64(raw)*0.001)
+	}
+
+	// Общее напряжение (Offset 150 -> 118+32, uint32 LE, 0.001 V)
+	rawVoltage := binary.LittleEndian.Uint32(frame[118+dataOffset : 122+dataOffset])
+	data.TotalVoltage = float64(rawVoltage) * 0.001
+
+	// Ток (Offset 158 -> 126+32, int32 LE, 0.001 A)
+	rawCurrent := int32(binary.LittleEndian.Uint32(frame[126+dataOffset : 130+dataOffset]))
+	data.Current = float64(rawCurrent) * 0.001
+
+	// Температура T1 (Offset 162 -> 130+32, int16 LE, 0.1 °C)
+	rawTemp1 := int16(binary.LittleEndian.Uint16(frame[130+dataOffset : 132+dataOffset]))
+	data.Temp1 = float64(rawTemp1) * 0.1
+
+	// Температура T2 (Offset 164 -> 132+32, int16 LE, 0.1 °C)
+	rawTemp2 := int16(binary.LittleEndian.Uint16(frame[132+dataOffset : 134+dataOffset]))
+	data.Temp2 = float64(rawTemp2) * 0.1
+
+	// Температура MOS (Offset 166 -> 134+32, int16 LE, 0.1 °C)
+	rawMOS := int16(binary.LittleEndian.Uint16(frame[134+dataOffset : 136+dataOffset]))
+	data.TempMOS = float64(rawMOS) * 0.1
+
+	// SOC % (Offset 173 -> 141+32)
+	data.SOC = frame[141+dataOffset]
+}
+
+func printBMSReport(d BMSData) {
+	fmt.Println("\n==========================================")
+	fmt.Println("       ПОКАЗАТЕЛИ JK BD4A8S4P (Go)")
+	fmt.Println("==========================================")
+	if d.DeviceModel != "" {
+		fmt.Printf(" Модель:            %s\n", d.DeviceModel)
+		fmt.Printf(" Прошивка:          %s (HW: %s)\n", d.SoftwareVer, d.HardwareVer)
+		fmt.Println("------------------------------------------")
+	}
+	fmt.Printf(" Напряжение сборки: %.2f V\n", d.TotalVoltage)
+	fmt.Printf(" Ток:               %.2f A\n", d.Current)
+	fmt.Printf(" Уровень заряда:    %d%%\n", d.SOC)
+	fmt.Printf(" Мощность:          %.1f W\n", d.TotalVoltage*d.Current)
+	fmt.Println("------------------------------------------")
+	fmt.Printf(" Температура MOS:   %.1f °C\n", d.TempMOS)
+	fmt.Printf(" Температура T1:    %.1f °C\n", d.Temp1)
+	fmt.Printf(" Температура T2:    %.1f °C\n", d.Temp2)
+	fmt.Println("------------------------------------------")
+	fmt.Println(" Ячейки (V):")
+	if len(d.Cells) == 0 {
+		fmt.Println("   [Нет данных по ячейкам]")
+	}
+	for idx, v := range d.Cells {
+		fmt.Printf("   Ячейка %d: %.3f V\n", idx+1, v)
+	}
+	fmt.Println("==========================================")
 }
