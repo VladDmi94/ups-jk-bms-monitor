@@ -227,56 +227,36 @@ func parseTelemetryFrame(frame []byte, data *BMSData) {
 		return
 	}
 
-	const cellOffset = 16
-	const dataOffset = 32
-
-	// Определяем количество активных ячеек из битовой маски
-	cellMask := binary.LittleEndian.Uint32(frame[54+cellOffset : 58+cellOffset])
-	cellCount := 0
-
-	for i := 0; i < 32; i++ {
-		if (cellMask & (1 << i)) != 0 {
-			cellCount = i + 1
-		}
-	}
-
-	if cellCount == 0 {
-		cellCount = 8 // Дефолт для BD4A8S4P (8S)
-	}
-	if cellCount > 32 {
-		cellCount = 32
-	}
-
-	// Чтение напряжений ячеек (0.001 V, uint16 Little-Endian)
+	// 1. Напряжения ячеек (8 штук, начиная с индекса 6)
+	cellCount := 8
 	data.Cells = make([]float64, 0, cellCount)
 	for i := 0; i < cellCount; i++ {
-		pos := 6 + cellOffset + i*2
+		pos := 6 + (i * 2)
 		raw := binary.LittleEndian.Uint16(frame[pos : pos+2])
 		data.Cells = append(data.Cells, float64(raw)*0.001)
 	}
 
-	// Общее напряжение (Offset 150 -> 118+32, uint32 LE, 0.001 V)
-	rawVoltage := binary.LittleEndian.Uint32(frame[118+dataOffset : 122+dataOffset])
+	// 2. Общие параметры (напряжение и ток)
+	rawVoltage := binary.LittleEndian.Uint32(frame[118+32 : 122+32])
 	data.TotalVoltage = float64(rawVoltage) * 0.001
 
-	// Ток (Offset 158 -> 126+32, int32 LE, 0.001 A)
-	rawCurrent := int32(binary.LittleEndian.Uint32(frame[126+dataOffset : 130+dataOffset]))
+	rawCurrent := int32(binary.LittleEndian.Uint32(frame[126+32 : 130+32]))
 	data.Current = float64(rawCurrent) * 0.001
 
-	// Температура T1 (Offset 162 -> 130+32, int16 LE, 0.1 °C)
-	rawTemp1 := int16(binary.LittleEndian.Uint16(frame[130+dataOffset : 132+dataOffset]))
-	data.Temp1 = float64(rawTemp1) * 0.1
+	// 3. Точные температуры по индексам из нового дампа
+	rawMOS := int16(binary.LittleEndian.Uint16(frame[144:146]))
+	rawT1 := int16(binary.LittleEndian.Uint16(frame[162:164]))
+	rawT2 := int16(binary.LittleEndian.Uint16(frame[164:166]))
 
-	// Температура T2 (Offset 164 -> 132+32, int16 LE, 0.1 °C)
-	rawTemp2 := int16(binary.LittleEndian.Uint16(frame[132+dataOffset : 134+dataOffset]))
-	data.Temp2 = float64(rawTemp2) * 0.1
-
-	// Температура MOS (Offset 166 -> 134+32, int16 LE, 0.1 °C)
-	rawMOS := int16(binary.LittleEndian.Uint16(frame[134+dataOffset : 136+dataOffset]))
 	data.TempMOS = float64(rawMOS) * 0.1
+	data.Temp1 = float64(rawT1) * 0.1
+	data.Temp2 = float64(rawT2) * 0.1
 
-	// SOC % (Offset 173 -> 141+32)
-	data.SOC = frame[141+dataOffset]
+	// 4. SOC %
+	if len(frame) > 173 {
+		data.SOC = frame[173]
+	}
+
 }
 
 func printBMSReport(d BMSData) {
