@@ -1,148 +1,111 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"fmt"
 	"log"
+	"math"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"os/signal"
+	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"tinygo.org/x/bluetooth"
 )
 
-const TargetBMSName = "60126310241"
-const TargetBMSAddress = "C8:47:80:53:5E:04"
-
 var (
-	serviceUUID, _ = bluetooth.ParseUUID("0000ffe0-0000-1000-8000-00805f9b34fb")
-	charUUID, _    = bluetooth.ParseUUID("0000ffe1-0000-1000-8000-00805f9b34fb")
+	serviceUUID, _      = bluetooth.ParseUUID("0000ffe0-0000-1000-8000-00805f9b34fb")
+	charUUID, _         = bluetooth.ParseUUID("0000ffe1-0000-1000-8000-00805f9b34fb")
+	headerResponseMagic = []byte{0x55, 0xAA, 0xEB, 0x90}
+	adapter             = bluetooth.DefaultAdapter
 )
 
-var headerResponseMagic = []byte{0x55, 0xAA, 0xEB, 0x90}
-
-type BMSData struct {
-	DeviceModel  string
-	HardwareVer  string
-	SoftwareVer  string
-	TotalVoltage float64
-	Current      float64
-	SOC          uint8
-	TempMOS      float64
-	Temp1        float64
-	Temp2        float64
-	Cells        []float64
-	HasTelemetry bool
+type Config struct {
+	TargetBMSName     string
+	BatteryCapacityAh float64
+	TelegramToken     string
+	TelegramChatID    string
+	DelayNotify       float64
+	ShutdownThreshold uint16
+	ShutdownTimeout   int
+	LogFile           string
 }
 
-var adapter = bluetooth.DefaultAdapter
+type BMSState struct {
+	mu           sync.Mutex
+	SOC          uint16
+	Current      float64
+	HasTelemetry bool
+	LastUpdated  time.Time
+}
 
-func main() {
-	fmt.Println("Инициализация Bluetooth адаптера...")
-	if err := adapter.Enable(); err != nil {
-		log.Fatalf("Ошибка включения BLE: %v", err)
-	}
-
-	fmt.Println("Поиск JK BMS...")
-
-	var targetDevice bluetooth.ScanResult
-	found := false
-
-	err := adapter.Scan(func(adapter *bluetooth.Adapter, result bluetooth.ScanResult) {
-		name := result.LocalName()
-		addr := result.Address.String()
-
-		if name == TargetBMSName || strings.EqualFold(addr, TargetBMSAddress) {
-			fmt.Printf("[УСПЕХ] Найдена JK BMS! Name: %s | Address: %s\n", name, addr)
-			targetDevice = result
-			found = true
-			adapter.StopScan()
-		}
-	})
-
-	if err != nil || !found {
-		log.Fatalf("Устройство не найдено.")
-	}
-
-	fmt.Printf("Подключение к %s...\n", targetDevice.Address.String())
-	device, err := adapter.Connect(targetDevice.Address, bluetooth.ConnectionParams{})
+func loadEnv(filePath string) map[string]string {
+	env := make(map[string]string)
+	file, err := os.Open(filePath)
 	if err != nil {
-		log.Fatalf("Не удалось подключиться: %v", err)
+		return env
 	}
-	defer device.Disconnect()
+	defer file.Close()
 
-	services, err := device.DiscoverServices([]bluetooth.UUID{serviceUUID})
-	if err != nil || len(services) == 0 {
-		log.Fatalf("Сервис FFE0 не найден: %v", err)
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			env[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+		}
 	}
-
-	chars, err := services[0].DiscoverCharacteristics([]bluetooth.UUID{charUUID})
-	if err != nil || len(chars) == 0 {
-		log.Fatalf("Характеристика FFE1 не найдена: %v", err)
+	if err := scanner.Err(); err != nil {
+		log.Printf("Ошибка чтения файла окружения: %v", err)
 	}
+	return env
+}
 
-	bmsChar := chars[0]
-	rxBuffer := make([]byte, 0, 2048)
-	var finalData BMSData
+func writeLog(logFile, message string) {
+	timestamp := time.Now().Format("02.01.2006 15:04:05")
+	entry := fmt.Sprintf("%s - %s\n", timestamp, message)
+	fmt.Print(entry)
 
-	err = bmsChar.EnableNotifications(func(buf []byte) {
-		rxBuffer = append(rxBuffer, buf...)
-		rxBuffer = processJKBuffer(rxBuffer, &finalData)
-	})
-
+	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		log.Fatalf("Ошибка подписки на уведомления: %v", err)
+		log.Printf("Ошибка записи в лог: %v", err)
+		return
 	}
+	defer f.Close()
+	f.WriteString(entry)
+}
 
-	time.Sleep(500 * time.Millisecond)
+func sendTelegram(token, chatID, text string) bool {
+	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
+	data := url.Values{}
+	data.Set("chat_id", chatID)
+	data.Set("text", text)
 
-	// 1. Сначала запрашиваем Device Info (0x97)
-	cmd97 := buildJKCommand(0x97)
-	fmt.Println("Отправка запроса Device Info (0x97)...")
-	if _, err := bmsChar.WriteWithoutResponse(cmd97); err != nil {
-		log.Fatalf("Ошибка отправки 0x97: %v", err)
+	client := http.Client{Timeout: 5 * time.Second}
+	resp, err := client.PostForm(apiURL, data)
+	if err != nil {
+		return false
 	}
+	defer resp.Body.Close()
 
-	time.Sleep(700 * time.Millisecond)
-
-	// 2. Затем запрашиваем Status/Telemetry (0x96) с повтором при необходимости
-	for attempt := 1; attempt <= 8; attempt++ {
-		cmd96 := buildJKCommand(0x96)
-		fmt.Printf("Отправка запроса Status (0x96), попытка %d/8...\n", attempt)
-		if _, err := bmsChar.WriteWithoutResponse(cmd96); err != nil {
-			log.Printf("Ошибка отправки 0x96: %v", err)
-		}
-
-		for i := 0; i < 10; i++ {
-			if finalData.HasTelemetry {
-				break
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-
-		if finalData.HasTelemetry {
-			break
-		}
-	}
-
-	if finalData.HasTelemetry || finalData.DeviceModel != "" {
-		printBMSReport(finalData)
-	} else {
-		fmt.Printf("\n[!] Ответ не получен. Накоплено байт в буфере: %d\n", len(rxBuffer))
-	}
-
-	fmt.Println("\nТест завершён.")
+	return resp.StatusCode == http.StatusOK
 }
 
 func buildJKCommand(cmdType byte) []byte {
 	cmd := make([]byte, 20)
-	cmd[0] = 0xAA
-	cmd[1] = 0x55
-	cmd[2] = 0x90
-	cmd[3] = 0xEB
-	cmd[4] = cmdType
-
-	var sum byte = 0
+	cmd[0], cmd[1], cmd[2], cmd[3], cmd[4] = 0xAA, 0x55, 0x90, 0xEB, cmdType
+	var sum byte
 	for i := 0; i < 19; i++ {
 		sum += cmd[i]
 	}
@@ -150,12 +113,11 @@ func buildJKCommand(cmdType byte) []byte {
 	return cmd
 }
 
-func processJKBuffer(buf []byte, outData *BMSData) []byte {
+func processJKBuffer(buf []byte, state *BMSState) []byte {
 	const frameSize = 300
 
 	for {
 		idx := bytes.Index(buf, headerResponseMagic)
-
 		if idx == -1 {
 			if len(buf) > 3 {
 				return append([]byte(nil), buf[len(buf)-3:]...)
@@ -172,117 +134,272 @@ func processJKBuffer(buf []byte, outData *BMSData) []byte {
 		}
 
 		frame := buf[:frameSize]
-
 		var crc byte
 		for _, b := range frame[:299] {
 			crc += b
 		}
 
-		if crc != frame[299] {
-			log.Printf("[RX] Ошибка CRC: calculated=0x%02X received=0x%02X", crc, frame[299])
+		if crc == frame[299] {
+			if frame[4] == 0x02 {
+				parseTelemetry(frame, state)
+			}
+		} else {
 			buf = buf[1:]
 			continue
-		}
-
-		frameType := frame[4]
-		counter := frame[5]
-
-		log.Printf("[RX] Frame 0x%02X, counter=0x%02X, CRC OK", frameType, counter)
-
-		switch frameType {
-		case 0x01:
-			log.Printf("[RX] Получен Frame 0x01 (settings)")
-
-		case 0x02:
-			parseTelemetryFrame(frame, outData)
-			outData.HasTelemetry = true
-			log.Printf("[RX] Telemetry: %.3f V, %.3f A, %d%%, %d cells",
-				outData.TotalVoltage, outData.Current, outData.SOC, len(outData.Cells))
-
-		case 0x03:
-			parseInfoFrame(frame, outData)
-
-		default:
-			log.Printf("[RX] Неизвестный Frame type: 0x%02X", frameType)
 		}
 
 		buf = buf[frameSize:]
 	}
 }
 
-func parseInfoFrame(frame []byte, data *BMSData) {
-	if len(frame) < 38 {
-		return
-	}
-
-	data.DeviceModel = strings.Trim(string(frame[6:22]), "\x00 ")
-	data.HardwareVer = strings.Trim(string(frame[22:30]), "\x00 ")
-	data.SoftwareVer = strings.Trim(string(frame[30:38]), "\x00 ")
-
-	log.Printf("[INFO] Model=%s HW=%s SW=%s", data.DeviceModel, data.HardwareVer, data.SoftwareVer)
-}
-
-func parseTelemetryFrame(frame []byte, data *BMSData) {
+func parseTelemetry(frame []byte, state *BMSState) {
 	if len(frame) < 300 {
 		return
 	}
 
-	// 1. Напряжения ячеек (8 штук, начиная с индекса 6)
-	cellCount := 8
-	data.Cells = make([]float64, 0, cellCount)
-	for i := 0; i < cellCount; i++ {
-		pos := 6 + (i * 2)
-		raw := binary.LittleEndian.Uint16(frame[pos : pos+2])
-		data.Cells = append(data.Cells, float64(raw)*0.001)
-	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
-	// 2. Общие параметры (напряжение и ток)
-	rawVoltage := binary.LittleEndian.Uint32(frame[118+32 : 122+32])
-	data.TotalVoltage = float64(rawVoltage) * 0.001
-
+	// Ток разряда/заряда (int32 LE, 0.001 A)
 	rawCurrent := int32(binary.LittleEndian.Uint32(frame[126+32 : 130+32]))
-	data.Current = float64(rawCurrent) * 0.001
+	state.Current = float64(rawCurrent) * 0.001
 
-	// 3. Точные температуры по индексам из нового дампа
-	rawMOS := int16(binary.LittleEndian.Uint16(frame[144:146]))
-	rawT1 := int16(binary.LittleEndian.Uint16(frame[162:164]))
-	rawT2 := int16(binary.LittleEndian.Uint16(frame[164:166]))
-
-	data.TempMOS = float64(rawMOS) * 0.1
-	data.Temp1 = float64(rawT1) * 0.1
-	data.Temp2 = float64(rawT2) * 0.1
-
-	// 4. SOC %
+	// SOC (%)
 	if len(frame) > 173 {
-		data.SOC = frame[173]
+		state.SOC = uint16(frame[173])
 	}
 
+	state.HasTelemetry = true
+	state.LastUpdated = time.Now()
 }
 
-func printBMSReport(d BMSData) {
-	fmt.Println("\n==========================================")
-	fmt.Println("       ПОКАЗАТЕЛИ JK BD4A8S4P (Go)")
-	fmt.Println("==========================================")
-	if d.DeviceModel != "" {
-		fmt.Printf(" Модель:            %s\n", d.DeviceModel)
-		fmt.Printf(" Прошивка:          %s (HW: %s)\n", d.SoftwareVer, d.HardwareVer)
-		fmt.Println("------------------------------------------")
+// Форматирование оставшегося времени в часы и минуты
+func formatRemainingTime(soc uint16, current float64, capacityAh float64) string {
+	if current >= -0.1 {
+		return "0 мин"
 	}
-	fmt.Printf(" Напряжение сборки: %.2f V\n", d.TotalVoltage)
-	fmt.Printf(" Ток:               %.2f A\n", d.Current)
-	fmt.Printf(" Уровень заряда:    %d%%\n", d.SOC)
-	fmt.Printf(" Мощность:          %.1f W\n", d.TotalVoltage*d.Current)
-	fmt.Println("------------------------------------------")
-	fmt.Printf(" Температура MOS:   %.1f °C\n", d.TempMOS)
-	fmt.Printf(" Температура T1:    %.1f °C\n", d.Temp1)
-	fmt.Printf(" Температура T2:    %.1f °C\n", d.Temp2)
-	fmt.Println("------------------------------------------")
-	fmt.Println(" Ячейки (V):")
-	if len(d.Cells) == 0 {
-		fmt.Println("   [Нет данных по ячейкам]")
+	dischargeCurrent := math.Abs(current)
+	remainingAh := capacityAh * (float64(soc) / 100.0)
+	totalHours := remainingAh / dischargeCurrent
+
+	h := int(totalHours)
+	m := int((totalHours - float64(h)) * 60)
+
+	if h > 0 {
+		return fmt.Sprintf("%d ч %d мин", h, m)
 	}
-	for idx, v := range d.Cells {
-		fmt.Printf("   Ячейка %d: %.3f V\n", idx+1, v)
+	return fmt.Sprintf("%d мин", m)
+}
+
+func main() {
+	env := loadEnv(".env")
+
+	logFile := env["LOG_FILE"]
+	if logFile == "" {
+		logFile = "ups_log.txt"
 	}
-	fmt.Println("==========================================")
+
+	token := env["TELEGRAM_TOKEN"]
+	chatID := env["TELEGRAM_CHAT_ID"]
+	if token == "" || chatID == "" {
+		writeLog(logFile, "Ошибка: TELEGRAM_TOKEN или TELEGRAM_CHAT_ID не заданы в .env!")
+		os.Exit(1)
+	}
+
+	targetBMSName := env["TARGET_BMS_NAME"]
+	if targetBMSName == "" {
+		writeLog(logFile, "Ошибка: TARGET_BMS_NAME не задан в .env!")
+		os.Exit(1)
+	}
+
+	capacityAh, _ := strconv.ParseFloat(env["BATTERY_CAPACITY_AH"], 64)
+	if capacityAh <= 0 {
+		capacityAh = 15.0
+	}
+
+	delayNotifySec, _ := strconv.ParseFloat(env["DELAY_NOTIFY"], 64)
+	if delayNotifySec < 0 {
+		delayNotifySec = 60
+	}
+
+	shutdownThreshold, _ := strconv.Atoi(env["SHUTDOWN_THRESHOLD"])
+	if shutdownThreshold <= 0 {
+		shutdownThreshold = 10
+	}
+
+	shutdownTimeout, _ := strconv.Atoi(env["SHUTDOWN_TIMEOUT"])
+	if shutdownTimeout <= 0 {
+		shutdownTimeout = 30
+	}
+
+	cfg := Config{
+		TargetBMSName:     targetBMSName,
+		BatteryCapacityAh: capacityAh,
+		TelegramToken:     token,
+		TelegramChatID:    chatID,
+		DelayNotify:       delayNotifySec,
+		ShutdownThreshold: uint16(shutdownThreshold),
+		ShutdownTimeout:   shutdownTimeout,
+		LogFile:           logFile,
+	}
+
+	writeLog(cfg.LogFile, "Инициализация Bluetooth адаптера...")
+	if err := adapter.Enable(); err != nil {
+		writeLog(cfg.LogFile, fmt.Sprintf("Ошибка включения BLE: %v", err))
+		os.Exit(1)
+	}
+
+	writeLog(cfg.LogFile, fmt.Sprintf("Поиск JK BMS с именем '%s'...", cfg.TargetBMSName))
+	var targetDevice bluetooth.ScanResult
+	found := false
+
+	err := adapter.Scan(func(a *bluetooth.Adapter, result bluetooth.ScanResult) {
+		if result.LocalName() == cfg.TargetBMSName {
+			targetDevice = result
+			found = true
+			a.StopScan()
+		}
+	})
+
+	if err != nil || !found {
+		writeLog(cfg.LogFile, "JK BMS не найдена при сканировании!")
+		os.Exit(1)
+	}
+
+	writeLog(cfg.LogFile, fmt.Sprintf("Подключение к %s (%s)...", cfg.TargetBMSName, targetDevice.Address.String()))
+	device, err := adapter.Connect(targetDevice.Address, bluetooth.ConnectionParams{})
+	if err != nil {
+		writeLog(cfg.LogFile, fmt.Sprintf("Не удалось подключиться: %v", err))
+		os.Exit(1)
+	}
+	defer device.Disconnect()
+
+	services, err := device.DiscoverServices([]bluetooth.UUID{serviceUUID})
+	if err != nil || len(services) == 0 {
+		writeLog(cfg.LogFile, "Сервис FFE0 не найден!")
+		os.Exit(1)
+	}
+
+	chars, err := services[0].DiscoverCharacteristics([]bluetooth.UUID{charUUID})
+	if err != nil || len(chars) == 0 {
+		writeLog(cfg.LogFile, "Характеристика FFE1 не найдена!")
+		os.Exit(1)
+	}
+
+	bmsChar := chars[0]
+	rxBuffer := make([]byte, 0, 2048)
+	var state BMSState
+
+	err = bmsChar.EnableNotifications(func(buf []byte) {
+		rxBuffer = append(rxBuffer, buf...)
+		rxBuffer = processJKBuffer(rxBuffer, &state)
+	})
+	if err != nil {
+		writeLog(cfg.LogFile, fmt.Sprintf("Ошибка подписки на уведомления: %v", err))
+		os.Exit(1)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	// Инициализация последовательности подписки для активации стрима
+	_, _ = bmsChar.WriteWithoutResponse(buildJKCommand(0x97))
+	time.Sleep(700 * time.Millisecond)
+	_, _ = bmsChar.WriteWithoutResponse(buildJKCommand(0x96))
+
+	writeLog(cfg.LogFile, "Мониторинг JK BMS успешно запущен.")
+
+	var (
+		wasOnBattery     bool
+		telegramNotified bool
+		powerLostTime    time.Time
+		chargeAtLoss     uint16
+	)
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-sigChan:
+			writeLog(cfg.LogFile, "Получен сигнал завершения. Остановка службы...")
+			return
+
+		case <-ticker.C:
+			state.mu.Lock()
+			hasData := state.HasTelemetry
+			charge := state.SOC
+			current := state.Current
+			lastUpdated := state.LastUpdated
+			state.mu.Unlock()
+
+			if !hasData {
+				continue
+			}
+
+			if time.Since(lastUpdated) > 15*time.Second {
+				writeLog(cfg.LogFile, "Предупреждение: Данные от BMS не поступают более 15 секунд!")
+			}
+
+			// Проверка питания: разряд фиксируем только если ток меньше -0.1 А
+			plugged := current >= -0.1
+			remainingTimeStr := formatRemainingTime(charge, current, cfg.BatteryCapacityAh)
+
+			// 1. Фиксация отключения питания
+			if !plugged && !wasOnBattery {
+				wasOnBattery = true
+				powerLostTime = time.Now()
+				chargeAtLoss = charge
+				msg := fmt.Sprintf("Отключение электричества! Заряд: %d%%, осталось: %s.",
+					chargeAtLoss, remainingTimeStr)
+				writeLog(cfg.LogFile, msg)
+			}
+
+			// 2. Уведомление в Telegram с задержкой
+			if wasOnBattery && !telegramNotified && !plugged {
+				elapsed := time.Since(powerLostTime).Seconds()
+				if elapsed >= cfg.DelayNotify {
+					msg := fmt.Sprintf("%s — Отключение электричества!\nЗаряд: %d%%, осталось ~%s.",
+						powerLostTime.Format("02.01.2006 15:04:05"), chargeAtLoss, remainingTimeStr)
+					if sendTelegram(cfg.TelegramToken, cfg.TelegramChatID, msg) {
+						telegramNotified = true
+					}
+				}
+			}
+
+			// 3. Восстановление питания
+			if plugged && wasOnBattery {
+				duration := int(time.Since(powerLostTime).Seconds())
+				msg := fmt.Sprintf("Электричество восстановлено. Заряд: %d%%, прошло: %d мин %d сек.",
+					charge, duration/60, duration%60)
+				writeLog(cfg.LogFile, msg)
+
+				if float64(duration) >= cfg.DelayNotify {
+					sendTelegram(cfg.TelegramToken, cfg.TelegramChatID,
+						fmt.Sprintf("%s — Электричество восстановлено.\nЗаряд: %d%%, прошло: %d мин %d сек.",
+							time.Now().Format("02.01.2006 15:04:05"), charge, duration/60, duration%60))
+				}
+
+				wasOnBattery = false
+				telegramNotified = false
+			}
+
+			// 4. Выключение ПК при критическом заряде
+			if wasOnBattery && charge > 0 && charge <= cfg.ShutdownThreshold {
+				duration := int(time.Since(powerLostTime).Seconds())
+				msg := fmt.Sprintf("Критический уровень заряда (%d%%)! Инициировано выключение ПК.", charge)
+				writeLog(cfg.LogFile, msg)
+
+				sendTelegram(cfg.TelegramToken, cfg.TelegramChatID,
+					fmt.Sprintf("%s — Выключение ПК!\nЗаряд: %d%%, прошло: %d мин %d сек.",
+						time.Now().Format("02.01.2006 15:04:05"), charge, duration/60, duration%60))
+
+				cmd := exec.Command("shutdown", "/s", "/t", strconv.Itoa(cfg.ShutdownTimeout))
+				_ = cmd.Run()
+				os.Exit(0)
+			}
+		}
+	}
 }
