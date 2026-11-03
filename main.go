@@ -4,14 +4,16 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
-	"log"
 	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,30 +23,78 @@ import (
 	"tinygo.org/x/bluetooth"
 )
 
+const (
+	frameSize      = 300              // размер кадра JK BMS
+	maxRxBuffer    = 4096             // защита от разрастания буфера приёма
+	dischargeLimit = -0.1             // ток ниже этого значения (А) = работа от батареи
+	debounceTicks  = 3                // сколько секунд подряд должно держаться новое состояние питания
+	staleAfter     = 15 * time.Second // после этого данные считаются устаревшими
+	kickAfter      = 10 * time.Second // если данных нет — повторно «будим» стрим BMS
+	reconnectAfter = 30 * time.Second // если данных нет — переподключаемся
+	minRetry       = 5 * time.Second
+	maxRetry       = 60 * time.Second
+	maxLogSize     = 1 << 20 // 1 МБ, затем лог ротируется в *.old
+)
+
 var (
 	serviceUUID, _      = bluetooth.ParseUUID("0000ffe0-0000-1000-8000-00805f9b34fb")
 	charUUID, _         = bluetooth.ParseUUID("0000ffe1-0000-1000-8000-00805f9b34fb")
 	headerResponseMagic = []byte{0x55, 0xAA, 0xEB, 0x90}
 	adapter             = bluetooth.DefaultAdapter
+	adapterReady        bool // используется только из горутины bmsLoop
 )
 
 type Config struct {
 	TargetBMSName     string
 	BatteryCapacityAh float64
-	TelegramToken     string
-	TelegramChatID    string
 	DelayNotify       float64
 	ShutdownThreshold uint16
 	ShutdownTimeout   int
-	LogFile           string
+	StaleShutdown     int // секунд без связи с BMS на батарее до аварийного выключения (0 = выкл.)
 }
 
-type BMSState struct {
-	mu           sync.Mutex
-	SOC          uint16
-	Current      float64
-	HasTelemetry bool
-	LastUpdated  time.Time
+// ---------- Логирование ----------
+
+var (
+	logMu   sync.Mutex
+	logPath = "ups_log.txt"
+)
+
+func writeLog(format string, args ...any) {
+	entry := fmt.Sprintf("%s - %s\n", time.Now().Format("02.01.2006 15:04:05"), fmt.Sprintf(format, args...))
+	fmt.Print(entry)
+
+	logMu.Lock()
+	defer logMu.Unlock()
+
+	if st, err := os.Stat(logPath); err == nil && st.Size() > maxLogSize {
+		_ = os.Rename(logPath, logPath+".old")
+	}
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Printf("Ошибка записи в лог: %v\n", err)
+		return
+	}
+	defer f.Close()
+	_, _ = f.WriteString(entry)
+}
+
+func fatal(format string, args ...any) {
+	writeLog(format, args...)
+	os.Exit(1)
+}
+
+// ---------- Конфигурация ----------
+
+// baseDir — папка с .env: рядом с exe (важно для служб/планировщика, где cwd = System32), иначе текущая.
+func baseDir() string {
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		if _, err := os.Stat(filepath.Join(dir, ".env")); err == nil {
+			return dir
+		}
+	}
+	return "."
 }
 
 func loadEnv(filePath string) map[string]string {
@@ -57,50 +107,67 @@ func loadEnv(filePath string) map[string]string {
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+		line := strings.TrimSpace(strings.TrimPrefix(scanner.Text(), "\ufeff")) // BOM от Блокнота
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) == 2 {
-			env[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
 		}
+		val = strings.TrimSpace(val)
+		if len(val) >= 2 && (val[0] == '"' || val[0] == '\'') && val[len(val)-1] == val[0] {
+			val = val[1 : len(val)-1]
+		}
+		env[strings.TrimSpace(key)] = val
 	}
 	if err := scanner.Err(); err != nil {
-		log.Printf("Ошибка чтения файла окружения: %v", err)
+		fmt.Printf("Ошибка чтения файла окружения: %v\n", err)
 	}
 	return env
 }
 
-func writeLog(logFile, message string) {
-	timestamp := time.Now().Format("02.01.2006 15:04:05")
-	entry := fmt.Sprintf("%s - %s\n", timestamp, message)
-	fmt.Print(entry)
-
-	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Printf("Ошибка записи в лог: %v", err)
-		return
+// envNum возвращает число из .env; если ключа нет или значение некорректно (< min) — значение по умолчанию.
+func envNum(env map[string]string, key string, def, min float64) float64 {
+	raw := env[key]
+	if raw == "" {
+		return def
 	}
-	defer f.Close()
-	f.WriteString(entry)
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil || v < min {
+		writeLog("Предупреждение: некорректное значение %s=%q, используется %v", key, raw, def)
+		return def
+	}
+	return v
 }
 
-func sendTelegram(token, chatID, text string) bool {
-	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
-	data := url.Values{}
-	data.Set("chat_id", chatID)
-	data.Set("text", text)
+// ---------- Состояние BMS ----------
 
-	client := http.Client{Timeout: 5 * time.Second}
-	resp, err := client.PostForm(apiURL, data)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-
-	return resp.StatusCode == http.StatusOK
+type Telemetry struct {
+	SOC     uint16
+	Current float64
+	Valid   bool
+	Updated time.Time
 }
+
+type BMSState struct {
+	mu sync.Mutex
+	t  Telemetry
+}
+
+func (s *BMSState) update(soc uint16, current float64) {
+	s.mu.Lock()
+	s.t = Telemetry{SOC: soc, Current: current, Valid: true, Updated: time.Now()}
+	s.mu.Unlock()
+}
+
+func (s *BMSState) get() Telemetry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.t
+}
+
+// ---------- Протокол JK BMS ----------
 
 func buildJKCommand(cmdType byte) []byte {
 	cmd := make([]byte, 20)
@@ -114,8 +181,6 @@ func buildJKCommand(cmdType byte) []byte {
 }
 
 func processJKBuffer(buf []byte, state *BMSState) []byte {
-	const frameSize = 300
-
 	for {
 		idx := bytes.Index(buf, headerResponseMagic)
 		if idx == -1 {
@@ -124,282 +189,488 @@ func processJKBuffer(buf []byte, state *BMSState) []byte {
 			}
 			return buf
 		}
-
 		if idx > 0 {
 			buf = buf[idx:]
 		}
-
 		if len(buf) < frameSize {
 			return buf
 		}
 
 		frame := buf[:frameSize]
 		var crc byte
-		for _, b := range frame[:299] {
+		for _, b := range frame[:frameSize-1] {
 			crc += b
 		}
-
-		if crc == frame[299] {
-			if frame[4] == 0x02 {
-				parseTelemetry(frame, state)
-			}
-		} else {
+		if crc != frame[frameSize-1] {
 			buf = buf[1:]
 			continue
 		}
-
+		if frame[4] == 0x02 {
+			parseTelemetry(frame, state)
+		}
 		buf = buf[frameSize:]
 	}
 }
 
 func parseTelemetry(frame []byte, state *BMSState) {
-	if len(frame) < 300 {
+	if len(frame) < frameSize {
 		return
 	}
 
-	state.mu.Lock()
-	defer state.mu.Unlock()
-
-	// Ток разряда/заряда (int32 LE, 0.001 A)
-	rawCurrent := int32(binary.LittleEndian.Uint32(frame[126+32 : 130+32]))
-	state.Current = float64(rawCurrent) * 0.001
-
-	// SOC (%)
-	if len(frame) > 173 {
-		state.SOC = uint16(frame[173])
+	// SOC (%) — значение вне 0..100 считаем мусором и кадр отбрасываем
+	soc := frame[173]
+	if soc > 100 {
+		return
 	}
 
-	state.HasTelemetry = true
-	state.LastUpdated = time.Now()
+	// Ток разряда/заряда (int32 LE, 0.001 А), смещение 158
+	rawCurrent := int32(binary.LittleEndian.Uint32(frame[158:162]))
+	state.update(uint16(soc), float64(rawCurrent)*0.001)
 }
 
-// Форматирование оставшегося времени в часы и минуты
-func formatRemainingTime(soc uint16, current float64, capacityAh float64) string {
-	if current >= -0.1 {
-		return "0 мин"
+// ---------- Telegram (асинхронно, с повторами) ----------
+
+type Notifier struct {
+	token, chatID string
+	queue         chan string
+}
+
+func NewNotifier(token, chatID string) *Notifier {
+	n := &Notifier{token: token, chatID: chatID, queue: make(chan string, 32)}
+	go n.worker()
+	return n
+}
+
+// Send не блокирует основной цикл, даже если интернета нет.
+func (n *Notifier) Send(text string) {
+	select {
+	case n.queue <- text:
+	default:
+		writeLog("Очередь Telegram переполнена, сообщение отброшено")
 	}
-	dischargeCurrent := math.Abs(current)
-	remainingAh := capacityAh * (float64(soc) / 100.0)
-	totalHours := remainingAh / dischargeCurrent
+}
 
-	h := int(totalHours)
-	m := int((totalHours - float64(h)) * 60)
+func (n *Notifier) worker() {
+	for text := range n.queue {
+		for attempt := 1; attempt <= 10; attempt++ {
+			retry, err := n.post(text)
+			if err == nil {
+				break
+			}
+			if attempt == 1 || !retry || attempt == 10 {
+				writeLog("Telegram: ошибка отправки (попытка %d): %v", attempt, err)
+			}
+			if !retry {
+				break
+			}
+			time.Sleep(10 * time.Second)
+		}
+	}
+}
 
+func (n *Notifier) post(text string) (retry bool, err error) {
+	data := url.Values{"chat_id": {n.chatID}, "text": {text}}
+	client := http.Client{Timeout: 10 * time.Second}
+	resp, err := client.PostForm("https://api.telegram.org/bot"+n.token+"/sendMessage", data)
+	if err != nil {
+		// текст ошибки содержит URL с токеном — вырезаем его
+		return true, errors.New(strings.ReplaceAll(err.Error(), n.token, "***"))
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		return false, nil
+	}
+	// 4xx (кроме 429) — ошибка настроек (токен/chat_id), повторять бессмысленно
+	permanent := resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests
+	return !permanent, fmt.Errorf("HTTP %d", resp.StatusCode)
+}
+
+// ---------- BLE: подключение и автопереподключение ----------
+
+func ensureAdapter() error {
+	if adapterReady {
+		return nil
+	}
+	if err := adapter.Enable(); err != nil {
+		return err
+	}
+	adapterReady = true
+	return nil
+}
+
+// findDevice сканирует эфир не дольше timeout (без этого Scan может висеть бесконечно).
+func findDevice(name string, timeout time.Duration) (bluetooth.ScanResult, bool) {
+	var res bluetooth.ScanResult
+	found := false
+
+	timer := time.AfterFunc(timeout, func() { _ = adapter.StopScan() })
+	defer timer.Stop()
+
+	err := adapter.Scan(func(a *bluetooth.Adapter, r bluetooth.ScanResult) {
+		if r.LocalName() == name {
+			res = r
+			found = true
+			_ = a.StopScan()
+		}
+	})
+	return res, found && err == nil
+}
+
+func connectWithTimeout(addr bluetooth.Address, timeout time.Duration) (bluetooth.Device, error) {
+	type result struct {
+		dev bluetooth.Device
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		d, err := adapter.Connect(addr, bluetooth.ConnectionParams{})
+		ch <- result{d, err}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.dev, r.err
+	case <-time.After(timeout):
+		// если подключение всё-таки завершится позже — аккуратно закрываем его
+		go func() {
+			if r := <-ch; r.err == nil {
+				_ = r.dev.Disconnect()
+			}
+		}()
+		return bluetooth.Device{}, errors.New("таймаут подключения")
+	}
+}
+
+// runSession: одно подключение к BMS. Возвращается при ошибке, потере данных или сигнале stop.
+func runSession(cfg Config, state *BMSState, stop <-chan struct{}) (gotData bool, err error) {
+	if err := ensureAdapter(); err != nil {
+		return false, fmt.Errorf("ошибка включения BLE: %w", err)
+	}
+
+	writeLog("Поиск JK BMS с именем '%s'...", cfg.TargetBMSName)
+	target, ok := findDevice(cfg.TargetBMSName, 20*time.Second)
+	if !ok {
+		return false, errors.New("JK BMS не найдена при сканировании")
+	}
+
+	writeLog("Подключение к %s (%s)...", cfg.TargetBMSName, target.Address.String())
+	device, err := connectWithTimeout(target.Address, 15*time.Second)
+	if err != nil {
+		return false, fmt.Errorf("не удалось подключиться: %w", err)
+	}
+	defer device.Disconnect()
+
+	services, err := device.DiscoverServices([]bluetooth.UUID{serviceUUID})
+	if err != nil || len(services) == 0 {
+		return false, errors.New("сервис FFE0 не найден")
+	}
+	chars, err := services[0].DiscoverCharacteristics([]bluetooth.UUID{charUUID})
+	if err != nil || len(chars) == 0 {
+		return false, errors.New("характеристика FFE1 не найдена")
+	}
+	bmsChar := chars[0]
+
+	// Буфер приёма защищён мьютексом: callback'и BLE могут прийти из разных горутин
+	var (
+		rxMu sync.Mutex
+		rx   = make([]byte, 0, 2048)
+	)
+	err = bmsChar.EnableNotifications(func(buf []byte) {
+		rxMu.Lock()
+		defer rxMu.Unlock()
+		rx = append(rx, buf...)
+		rx = processJKBuffer(rx, state)
+		if len(rx) > maxRxBuffer {
+			rx = rx[:0]
+		}
+	})
+	if err != nil {
+		return false, fmt.Errorf("ошибка подписки на уведомления: %w", err)
+	}
+
+	// Последовательность команд, активирующая стрим данных
+	kick := func() error {
+		if _, err := bmsChar.WriteWithoutResponse(buildJKCommand(0x97)); err != nil {
+			return err
+		}
+		time.Sleep(700 * time.Millisecond)
+		_, err := bmsChar.WriteWithoutResponse(buildJKCommand(0x96))
+		return err
+	}
+
+	time.Sleep(500 * time.Millisecond)
+	if err := kick(); err != nil {
+		return false, fmt.Errorf("ошибка отправки команд: %w", err)
+	}
+	writeLog("Мониторинг JK BMS успешно запущен.")
+
+	started := time.Now()
+	lastKick := started
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stop:
+			return gotData, nil
+		case <-ticker.C:
+		}
+
+		last := started
+		if u := state.get().Updated; u.After(started) {
+			last = u
+			gotData = true
+		}
+		age := time.Since(last)
+
+		if age > reconnectAfter {
+			return gotData, fmt.Errorf("нет данных от BMS более %d с", int(reconnectAfter.Seconds()))
+		}
+		if age > kickAfter && time.Since(lastKick) > kickAfter {
+			lastKick = time.Now()
+			_ = kick() // если соединение мертво — это выяснится по таймауту выше
+		}
+	}
+}
+
+// bmsLoop держит соединение с BMS «вечно»: при любой проблеме переподключается с растущей паузой.
+func bmsLoop(cfg Config, state *BMSState, stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	delay := minRetry
+	for {
+		gotData, err := runSession(cfg, state, stop)
+
+		select {
+		case <-stop:
+			return
+		default:
+		}
+
+		if gotData {
+			delay = minRetry
+		}
+		if err != nil {
+			writeLog("BLE: %v. Повтор через %s", err, delay)
+		}
+
+		select {
+		case <-stop:
+			return
+		case <-time.After(delay):
+		}
+		if !gotData && delay < maxRetry {
+			delay *= 2
+			if delay > maxRetry {
+				delay = maxRetry
+			}
+		}
+	}
+}
+
+// ---------- Вспомогательные функции ----------
+
+func formatRemainingTime(soc uint16, current, capacityAh float64) string {
+	if current >= dischargeLimit {
+		return "н/д"
+	}
+	hours := capacityAh * (float64(soc) / 100.0) / math.Abs(current)
+	h := int(hours)
+	m := int((hours - float64(h)) * 60)
 	if h > 0 {
 		return fmt.Sprintf("%d ч %d мин", h, m)
 	}
 	return fmt.Sprintf("%d мин", m)
 }
 
+func fmtDur(d time.Duration) string {
+	s := int(d.Seconds())
+	return fmt.Sprintf("%d мин %d сек", s/60, s%60)
+}
+
+func stamp() string { return time.Now().Format("02.01.2006 15:04:05") }
+
+func shutdownCmd(timeoutSec int) *exec.Cmd {
+	if runtime.GOOS == "windows" {
+		return exec.Command("shutdown", "/s", "/t", strconv.Itoa(timeoutSec))
+	}
+	return exec.Command("shutdown", "-h", fmt.Sprintf("+%d", (timeoutSec+59)/60))
+}
+
+func abortShutdownCmd() *exec.Cmd {
+	if runtime.GOOS == "windows" {
+		return exec.Command("shutdown", "/a")
+	}
+	return exec.Command("shutdown", "-c")
+}
+
+// ---------- main ----------
+
 func main() {
-	env := loadEnv(".env")
+	dir := baseDir()
+	env := loadEnv(filepath.Join(dir, ".env"))
 
-	logFile := env["LOG_FILE"]
-	if logFile == "" {
-		logFile = "ups_log.txt"
+	logName := env["LOG_FILE"]
+	if logName == "" {
+		logName = "ups_log.txt"
 	}
+	if !filepath.IsAbs(logName) {
+		logName = filepath.Join(dir, logName)
+	}
+	logPath = logName
 
-	token := env["TELEGRAM_TOKEN"]
-	chatID := env["TELEGRAM_CHAT_ID"]
+	token, chatID := env["TELEGRAM_TOKEN"], env["TELEGRAM_CHAT_ID"]
 	if token == "" || chatID == "" {
-		writeLog(logFile, "Ошибка: TELEGRAM_TOKEN или TELEGRAM_CHAT_ID не заданы в .env!")
-		os.Exit(1)
+		fatal("Ошибка: TELEGRAM_TOKEN или TELEGRAM_CHAT_ID не заданы в .env!")
 	}
-
-	targetBMSName := env["TARGET_BMS_NAME"]
-	if targetBMSName == "" {
-		writeLog(logFile, "Ошибка: TARGET_BMS_NAME не задан в .env!")
-		os.Exit(1)
-	}
-
-	capacityAh, _ := strconv.ParseFloat(env["BATTERY_CAPACITY_AH"], 64)
-	if capacityAh <= 0 {
-		capacityAh = 15.0
-	}
-
-	delayNotifySec, _ := strconv.ParseFloat(env["DELAY_NOTIFY"], 64)
-	if delayNotifySec < 0 {
-		delayNotifySec = 60
-	}
-
-	shutdownThreshold, _ := strconv.Atoi(env["SHUTDOWN_THRESHOLD"])
-	if shutdownThreshold <= 0 {
-		shutdownThreshold = 10
-	}
-
-	shutdownTimeout, _ := strconv.Atoi(env["SHUTDOWN_TIMEOUT"])
-	if shutdownTimeout <= 0 {
-		shutdownTimeout = 30
+	if env["TARGET_BMS_NAME"] == "" {
+		fatal("Ошибка: TARGET_BMS_NAME не задан в .env!")
 	}
 
 	cfg := Config{
-		TargetBMSName:     targetBMSName,
-		BatteryCapacityAh: capacityAh,
-		TelegramToken:     token,
-		TelegramChatID:    chatID,
-		DelayNotify:       delayNotifySec,
-		ShutdownThreshold: uint16(shutdownThreshold),
-		ShutdownTimeout:   shutdownTimeout,
-		LogFile:           logFile,
+		TargetBMSName:     env["TARGET_BMS_NAME"],
+		BatteryCapacityAh: envNum(env, "BATTERY_CAPACITY_AH", 15, 0.1),
+		DelayNotify:       envNum(env, "DELAY_NOTIFY", 60, 0),
+		ShutdownThreshold: uint16(envNum(env, "SHUTDOWN_THRESHOLD", 10, 1)),
+		ShutdownTimeout:   int(envNum(env, "SHUTDOWN_TIMEOUT", 30, 1)),
+		StaleShutdown:     int(envNum(env, "STALE_SHUTDOWN", 120, 0)),
+	}
+	if cfg.ShutdownThreshold > 100 {
+		writeLog("Предупреждение: SHUTDOWN_THRESHOLD > 100, используется 10")
+		cfg.ShutdownThreshold = 10
 	}
 
-	writeLog(cfg.LogFile, "Инициализация Bluetooth адаптера...")
-	if err := adapter.Enable(); err != nil {
-		writeLog(cfg.LogFile, fmt.Sprintf("Ошибка включения BLE: %v", err))
-		os.Exit(1)
-	}
-
-	writeLog(cfg.LogFile, fmt.Sprintf("Поиск JK BMS с именем '%s'...", cfg.TargetBMSName))
-	var targetDevice bluetooth.ScanResult
-	found := false
-
-	err := adapter.Scan(func(a *bluetooth.Adapter, result bluetooth.ScanResult) {
-		if result.LocalName() == cfg.TargetBMSName {
-			targetDevice = result
-			found = true
-			a.StopScan()
-		}
-	})
-
-	if err != nil || !found {
-		writeLog(cfg.LogFile, "JK BMS не найдена при сканировании!")
-		os.Exit(1)
-	}
-
-	writeLog(cfg.LogFile, fmt.Sprintf("Подключение к %s (%s)...", cfg.TargetBMSName, targetDevice.Address.String()))
-	device, err := adapter.Connect(targetDevice.Address, bluetooth.ConnectionParams{})
-	if err != nil {
-		writeLog(cfg.LogFile, fmt.Sprintf("Не удалось подключиться: %v", err))
-		os.Exit(1)
-	}
-	defer device.Disconnect()
-
-	services, err := device.DiscoverServices([]bluetooth.UUID{serviceUUID})
-	if err != nil || len(services) == 0 {
-		writeLog(cfg.LogFile, "Сервис FFE0 не найден!")
-		os.Exit(1)
-	}
-
-	chars, err := services[0].DiscoverCharacteristics([]bluetooth.UUID{charUUID})
-	if err != nil || len(chars) == 0 {
-		writeLog(cfg.LogFile, "Характеристика FFE1 не найдена!")
-		os.Exit(1)
-	}
-
-	bmsChar := chars[0]
-	rxBuffer := make([]byte, 0, 2048)
+	notifier := NewNotifier(token, chatID)
 	var state BMSState
 
-	err = bmsChar.EnableNotifications(func(buf []byte) {
-		rxBuffer = append(rxBuffer, buf...)
-		rxBuffer = processJKBuffer(rxBuffer, &state)
-	})
-	if err != nil {
-		writeLog(cfg.LogFile, fmt.Sprintf("Ошибка подписки на уведомления: %v", err))
-		os.Exit(1)
-	}
-
-	time.Sleep(500 * time.Millisecond)
-
-	// Инициализация последовательности подписки для активации стрима
-	_, _ = bmsChar.WriteWithoutResponse(buildJKCommand(0x97))
-	time.Sleep(700 * time.Millisecond)
-	_, _ = bmsChar.WriteWithoutResponse(buildJKCommand(0x96))
-
-	writeLog(cfg.LogFile, "Мониторинг JK BMS успешно запущен.")
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go bmsLoop(cfg, &state, stop, done)
 
 	var (
-		wasOnBattery     bool
-		telegramNotified bool
-		powerLostTime    time.Time
-		chargeAtLoss     uint16
+		onBattery       bool // подтверждённое состояние (с антидребезгом)
+		pending         int  // сколько тиков подряд наблюдается противоположное состояние
+		notified        bool
+		shutdownStarted bool
+		stale           bool
+		lossTime        time.Time
+		chargeAtLoss    uint16
+		nextShutdownTry time.Time
 	)
+
+	doShutdown := func(reason string) {
+		if shutdownStarted || time.Now().Before(nextShutdownTry) {
+			return
+		}
+		writeLog("%s Инициировано выключение ПК.", reason)
+		if err := shutdownCmd(cfg.ShutdownTimeout).Run(); err != nil {
+			writeLog("Не удалось выполнить shutdown: %v", err)
+			nextShutdownTry = time.Now().Add(10 * time.Second)
+			return
+		}
+		shutdownStarted = true
+		notifier.Send(fmt.Sprintf("%s — Выключение ПК!\n%s", stamp(), reason))
+	}
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-sigChan:
-			writeLog(cfg.LogFile, "Получен сигнал завершения. Остановка службы...")
+			writeLog("Получен сигнал завершения. Остановка службы...")
+			close(stop)
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+			}
 			return
-
 		case <-ticker.C:
-			state.mu.Lock()
-			hasData := state.HasTelemetry
-			charge := state.SOC
-			current := state.Current
-			lastUpdated := state.LastUpdated
-			state.mu.Unlock()
+		}
 
-			if !hasData {
-				continue
+		t := state.get()
+		if !t.Valid {
+			continue
+		}
+
+		// Устаревшие данные не используем для принятия решений
+		age := time.Since(t.Updated)
+		if age > staleAfter {
+			if !stale {
+				stale = true
+				writeLog("Нет данных от BMS более %d с, идёт переподключение...", int(staleAfter.Seconds()))
 			}
-
-			if time.Since(lastUpdated) > 15*time.Second {
-				writeLog(cfg.LogFile, "Предупреждение: Данные от BMS не поступают более 15 секунд!")
+			// Страховка: на батарее и связи с BMS нет — не ждём, пока батарея сядет «вслепую»
+			if onBattery && cfg.StaleShutdown > 0 && age > time.Duration(cfg.StaleShutdown)*time.Second {
+				doShutdown(fmt.Sprintf("Связь с BMS потеряна на %d с при работе от батареи (последний заряд: %d%%).",
+					int(age.Seconds()), t.SOC))
 			}
+			continue
+		}
+		if stale {
+			stale = false
+			writeLog("Связь с BMS восстановлена.")
+		}
 
-			// Проверка питания: разряд фиксируем только если ток меньше -0.1 А
-			plugged := current >= -0.1
-			remainingTimeStr := formatRemainingTime(charge, current, cfg.BatteryCapacityAh)
+		// Антидребезг: смена состояния питания должна продержаться debounceTicks секунд
+		battery := t.Current < dischargeLimit
+		if battery == onBattery {
+			pending = 0
+		} else {
+			pending++
+		}
 
-			// 1. Фиксация отключения питания
-			if !plugged && !wasOnBattery {
-				wasOnBattery = true
-				powerLostTime = time.Now()
-				chargeAtLoss = charge
-				msg := fmt.Sprintf("Отключение электричества! Заряд: %d%%, осталось: %s.",
-					chargeAtLoss, remainingTimeStr)
-				writeLog(cfg.LogFile, msg)
-			}
+		if pending >= debounceTicks {
+			pending = 0
+			if battery {
+				// 1. Отключение питания
+				onBattery = true
+				notified = false
+				lossTime = time.Now()
+				chargeAtLoss = t.SOC
+				writeLog("Отключение электричества! Заряд: %d%%, осталось: %s.",
+					chargeAtLoss, formatRemainingTime(t.SOC, t.Current, cfg.BatteryCapacityAh))
+			} else {
+				// 3. Восстановление питания
+				duration := time.Since(lossTime)
+				writeLog("Электричество восстановлено. Заряд: %d%%, прошло: %s.", t.SOC, fmtDur(duration))
 
-			// 2. Уведомление в Telegram с задержкой
-			if wasOnBattery && !telegramNotified && !plugged {
-				elapsed := time.Since(powerLostTime).Seconds()
-				if elapsed >= cfg.DelayNotify {
-					msg := fmt.Sprintf("%s — Отключение электричества!\nЗаряд: %d%%, осталось ~%s.",
-						powerLostTime.Format("02.01.2006 15:04:05"), chargeAtLoss, remainingTimeStr)
-					if sendTelegram(cfg.TelegramToken, cfg.TelegramChatID, msg) {
-						telegramNotified = true
+				if shutdownStarted {
+					if err := abortShutdownCmd().Run(); err != nil {
+						writeLog("Не удалось отменить выключение: %v", err)
+					} else {
+						writeLog("Выключение ПК отменено.")
+						notifier.Send(fmt.Sprintf("%s — Питание вернулось, выключение ПК отменено.", stamp()))
 					}
+					shutdownStarted = false
 				}
-			}
-
-			// 3. Восстановление питания
-			if plugged && wasOnBattery {
-				duration := int(time.Since(powerLostTime).Seconds())
-				msg := fmt.Sprintf("Электричество восстановлено. Заряд: %d%%, прошло: %d мин %d сек.",
-					charge, duration/60, duration%60)
-				writeLog(cfg.LogFile, msg)
-
-				if float64(duration) >= cfg.DelayNotify {
-					sendTelegram(cfg.TelegramToken, cfg.TelegramChatID,
-						fmt.Sprintf("%s — Электричество восстановлено.\nЗаряд: %d%%, прошло: %d мин %d сек.",
-							time.Now().Format("02.01.2006 15:04:05"), charge, duration/60, duration%60))
+				if notified {
+					notifier.Send(fmt.Sprintf("%s — Электричество восстановлено.\nЗаряд: %d%%, прошло: %s.",
+						stamp(), t.SOC, fmtDur(duration)))
 				}
-
-				wasOnBattery = false
-				telegramNotified = false
+				onBattery = false
+				notified = false
 			}
+		}
 
-			// 4. Выключение ПК при критическом заряде
-			if wasOnBattery && charge > 0 && charge <= cfg.ShutdownThreshold {
-				duration := int(time.Since(powerLostTime).Seconds())
-				msg := fmt.Sprintf("Критический уровень заряда (%d%%)! Инициировано выключение ПК.", charge)
-				writeLog(cfg.LogFile, msg)
+		if !onBattery {
+			continue
+		}
 
-				sendTelegram(cfg.TelegramToken, cfg.TelegramChatID,
-					fmt.Sprintf("%s — Выключение ПК!\nЗаряд: %d%%, прошло: %d мин %d сек.",
-						time.Now().Format("02.01.2006 15:04:05"), charge, duration/60, duration%60))
+		// 2. Уведомление в Telegram с задержкой (чтобы не спамить из-за коротких пропаданий)
+		if !notified && time.Since(lossTime).Seconds() >= cfg.DelayNotify {
+			notifier.Send(fmt.Sprintf("%s — Отключение электричества!\nЗаряд: %d%%, осталось ~%s.",
+				lossTime.Format("02.01.2006 15:04:05"), t.SOC,
+				formatRemainingTime(t.SOC, t.Current, cfg.BatteryCapacityAh)))
+			notified = true
+		}
 
-				cmd := exec.Command("shutdown", "/s", "/t", strconv.Itoa(cfg.ShutdownTimeout))
-				_ = cmd.Run()
-				os.Exit(0)
-			}
+		// 4. Выключение ПК при критическом заряде
+		if t.SOC <= cfg.ShutdownThreshold {
+			doShutdown(fmt.Sprintf("Критический уровень заряда (%d%%), на батарее: %s.",
+				t.SOC, fmtDur(time.Since(lossTime))))
 		}
 	}
 }
