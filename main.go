@@ -30,6 +30,7 @@ const (
 	debounceTicks  = 3                // сколько секунд подряд должно держаться новое состояние питания
 	staleAfter     = 15 * time.Second // после этого данные считаются устаревшими
 	kickAfter      = 10 * time.Second // если данных нет — повторно «будим» стрим BMS
+	kickTimeout    = 5 * time.Second  // максимум на одну команду «будоражения» (защита от зависшего await)
 	reconnectAfter = 30 * time.Second // если данных нет — переподключаемся
 	minRetry       = 5 * time.Second
 	maxRetry       = 60 * time.Second
@@ -45,12 +46,15 @@ var (
 )
 
 type Config struct {
-	TargetBMSName     string
-	BatteryCapacityAh float64
-	DelayNotify       float64
-	ShutdownThreshold uint16
-	ShutdownTimeout   int
-	StaleShutdown     int // секунд без связи с BMS на батарее до аварийного выключения (0 = выкл.)
+	TargetBMSName       string
+	BatteryCapacityAh   float64
+	DelayNotify         float64
+	ShutdownThreshold   uint16
+	LowBatteryThreshold uint16 // порог SOC (%) для предупреждения о низком заряде
+	ShutdownTimeout     int
+	StaleShutdown       int     // секунд без связи с BMS на батарее до аварийного выключения (0 = выкл.)
+	TempThreshold       float64 // порог температуры (°C) для предупреждения в Telegram
+	TempHysteresis      float64 // откат (°C) ниже порога, после которого предупреждение может повториться
 }
 
 // ---------- Логирование ----------
@@ -144,10 +148,14 @@ func envNum(env map[string]string, key string, def, min float64) float64 {
 // ---------- Состояние BMS ----------
 
 type Telemetry struct {
-	SOC     uint16
-	Current float64
-	Valid   bool
-	Updated time.Time
+	SOC             uint16
+	Current         float64 // мгновенный ток (А)
+	SmoothedCurrent float64 // EMA-сглаженный ток (А), для расчёта оставшегося времени
+	Mos             float64 // температура MOS, °C
+	T1              float64 // температура датчика T1, °C
+	T2              float64 // температура датчика T2, °C
+	Valid           bool
+	Updated         time.Time
 }
 
 type BMSState struct {
@@ -155,9 +163,20 @@ type BMSState struct {
 	t  Telemetry
 }
 
-func (s *BMSState) update(soc uint16, current float64) {
+// emaAlpha — коэффициент сглаживания тока (0..1). Чем меньше, тем плавнее.
+// 0.1 = вес нового значения 10%, за ~10 с подстраивается под реальное изменение.
+const emaAlpha = 0.1
+
+func (s *BMSState) update(soc uint16, current, mos, t1, t2 float64) {
 	s.mu.Lock()
-	s.t = Telemetry{SOC: soc, Current: current, Valid: true, Updated: time.Now()}
+	// EMA: новое сглаженное = alpha * мгновенное + (1 - alpha) * предыдущее сглаженное
+	smoothed := s.t.SmoothedCurrent
+	if !s.t.Valid {
+		smoothed = current // первое значение — без сглаживания
+	} else {
+		smoothed = emaAlpha*current + (1-emaAlpha)*smoothed
+	}
+	s.t = Telemetry{SOC: soc, Current: current, SmoothedCurrent: smoothed, Mos: mos, T1: t1, T2: t2, Valid: true, Updated: time.Now()}
 	s.mu.Unlock()
 }
 
@@ -225,7 +244,12 @@ func parseTelemetry(frame []byte, state *BMSState) {
 
 	// Ток разряда/заряда (int32 LE, 0.001 А), смещение 158
 	rawCurrent := int32(binary.LittleEndian.Uint32(frame[158:162]))
-	state.update(uint16(soc), float64(rawCurrent)*0.001)
+
+	// Температуры (int16 LE, 0.1 °C): MOS 144:145, T1 162:163, T2 164:165
+	mos := float64(int16(binary.LittleEndian.Uint16(frame[144:146]))) * 0.1
+	t1 := float64(int16(binary.LittleEndian.Uint16(frame[162:164]))) * 0.1
+	t2 := float64(int16(binary.LittleEndian.Uint16(frame[164:166]))) * 0.1
+	state.update(uint16(soc), float64(rawCurrent)*0.001, mos, t1, t2)
 }
 
 // ---------- Telegram (асинхронно, с повторами) ----------
@@ -341,6 +365,46 @@ func connectWithTimeout(addr bluetooth.Address, timeout time.Duration) (bluetoot
 	}
 }
 
+// waitUpdatedAfter: ждёт, пока телеметрия обновится строго позже момента after.
+// after — снимок state.get().Updated, взятый ДО отправки команды; иначе «уснувший»
+// стрим может дать свежий Updated от предыдущего кадра и мы ложно решим, что BMS отозвался.
+// Возвращает true, если данные пришли, false — по таймауту.
+func waitUpdatedAfter(state *BMSState, after time.Time, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if u := state.get().Updated; !u.IsZero() && u.After(after) {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
+}
+
+// writeWithTimeout: запись в характеристику с защитой от зависшего awaitAsyncOperation.
+// WinRT-запись блокирует вызывающую горутины до завершения операции; если BLE-адаптер
+// «лежит», без таймаута она может висеть неопределённо. По образцу connectWithTimeout.
+func writeWithTimeout(c bluetooth.DeviceCharacteristic, p []byte, timeout time.Duration) error {
+	type result struct {
+		n   int
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		n, err := c.WriteWithoutResponse(p)
+		ch <- result{n, err}
+	}()
+
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			return r.err
+		}
+		return nil
+	case <-time.After(timeout):
+		return errors.New("таймаут записи в BMS")
+	}
+}
+
 // runSession: одно подключение к BMS. Возвращается при ошибке, потере данных или сигнале stop.
 func runSession(cfg Config, state *BMSState, stop <-chan struct{}) (gotData bool, err error) {
 	if err := ensureAdapter(); err != nil {
@@ -388,14 +452,26 @@ func runSession(cfg Config, state *BMSState, stop <-chan struct{}) (gotData bool
 		return false, fmt.Errorf("ошибка подписки на уведомления: %w", err)
 	}
 
-	// Последовательность команд, активирующая стрим данных
+	// Ровно как ESPHome: сначала 0x97 (один раз, при подключении),
+	// потом повторяем 0x96 с интервалом 2с, пока BMS не начнёт стримить (0x02).
 	kick := func() error {
-		if _, err := bmsChar.WriteWithoutResponse(buildJKCommand(0x97)); err != nil {
+		// 0x97 — один раз, «подготовка» (ESPHome: ESP_GATTC_REG_FOR_NOTIFY_EVT)
+		if err := writeWithTimeout(bmsChar, buildJKCommand(0x97), kickTimeout); err != nil {
 			return err
 		}
-		time.Sleep(700 * time.Millisecond)
-		_, err := bmsChar.WriteWithoutResponse(buildJKCommand(0x96))
-		return err
+		// 0x96 — повторяем, пока 0x02 не придёт (ESPHome: update())
+		before := state.get().Updated
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			if err := writeWithTimeout(bmsChar, buildJKCommand(0x96), kickTimeout); err != nil {
+				return err
+			}
+			if waitUpdatedAfter(state, before, 2*time.Second) {
+				return nil
+			}
+			time.Sleep(2 * time.Second)
+		}
+		return errors.New("BMS не отозвался на будоражение")
 	}
 
 	time.Sleep(500 * time.Millisecond)
@@ -469,11 +545,14 @@ func bmsLoop(cfg Config, state *BMSState, stop <-chan struct{}, done chan<- stru
 
 // ---------- Вспомогательные функции ----------
 
-func formatRemainingTime(soc uint16, current, capacityAh float64) string {
-	if current >= dischargeLimit {
+// formatRemainingTime: расчёт оставшегося времени по СГЛАЖЕННОМУ току (EMA).
+// Мгновенный ток скачет (балансировка, нагрузка, шум), из-за чего время «прыгает».
+// EMA с alpha=0.1 сглаживает шум, но за ~10 с подстраивается под реальное изменение нагрузки.
+func formatRemainingTime(soc uint16, smoothedCurrent, capacityAh float64) string {
+	if smoothedCurrent >= dischargeLimit {
 		return "н/д"
 	}
-	hours := capacityAh * (float64(soc) / 100.0) / math.Abs(current)
+	hours := capacityAh * (float64(soc) / 100.0) / math.Abs(smoothedCurrent)
 	h := int(hours)
 	m := int((hours - float64(h)) * 60)
 	if h > 0 {
@@ -527,12 +606,15 @@ func main() {
 	}
 
 	cfg := Config{
-		TargetBMSName:     env["TARGET_BMS_NAME"],
-		BatteryCapacityAh: envNum(env, "BATTERY_CAPACITY_AH", 15, 0.1),
-		DelayNotify:       envNum(env, "DELAY_NOTIFY", 60, 0),
-		ShutdownThreshold: uint16(envNum(env, "SHUTDOWN_THRESHOLD", 10, 1)),
-		ShutdownTimeout:   int(envNum(env, "SHUTDOWN_TIMEOUT", 30, 1)),
-		StaleShutdown:     int(envNum(env, "STALE_SHUTDOWN", 120, 0)),
+		TargetBMSName:       env["TARGET_BMS_NAME"],
+		BatteryCapacityAh:   envNum(env, "BATTERY_CAPACITY_AH", 15, 0.1),
+		DelayNotify:         envNum(env, "DELAY_NOTIFY", 60, 0),
+		ShutdownThreshold:   uint16(envNum(env, "SHUTDOWN_THRESHOLD", 10, 1)),
+		LowBatteryThreshold: uint16(envNum(env, "LOW_BATTERY_THRESHOLD", 20, 1)),
+		ShutdownTimeout:     int(envNum(env, "SHUTDOWN_TIMEOUT", 30, 1)),
+		StaleShutdown:       int(envNum(env, "STALE_SHUTDOWN", 0, 0)),
+		TempThreshold:       envNum(env, "TEMP_THRESHOLD", 69, 0),
+		TempHysteresis:      envNum(env, "TEMP_HYSTERESIS", 5, 0),
 	}
 	if cfg.ShutdownThreshold > 100 {
 		writeLog("Предупреждение: SHUTDOWN_THRESHOLD > 100, используется 10")
@@ -547,14 +629,17 @@ func main() {
 	go bmsLoop(cfg, &state, stop, done)
 
 	var (
-		onBattery       bool // подтверждённое состояние (с антидребезгом)
-		pending         int  // сколько тиков подряд наблюдается противоположное состояние
-		notified        bool
-		shutdownStarted bool
-		stale           bool
-		lossTime        time.Time
-		chargeAtLoss    uint16
-		nextShutdownTry time.Time
+		onBattery          bool // подтверждённое состояние (с антидребезгом)
+		pending            int  // сколько тиков подряд наблюдается противоположное состояние
+		notified           bool
+		lowBatteryNotified bool // предупреждение о низком заряде уже отправлено
+		shutdownStarted    bool
+		stale              bool
+		lossTime           time.Time
+		chargeAtLoss       uint16
+		smoothedAtLoss     float64 // снимок сглаженного тока в момент отключения (для согласованности лог/Telegram)
+		nextShutdownTry    time.Time
+		tempAlerted        bool // предупреждение о температуре уже отправлено (сработает повторно после отката ниже порога)
 	)
 
 	doShutdown := func(reason string) {
@@ -630,8 +715,9 @@ func main() {
 				notified = false
 				lossTime = time.Now()
 				chargeAtLoss = t.SOC
+				smoothedAtLoss = t.SmoothedCurrent // снимок для согласованности лог/Telegram
 				writeLog("Отключение электричества! Заряд: %d%%, осталось: %s.",
-					chargeAtLoss, formatRemainingTime(t.SOC, t.Current, cfg.BatteryCapacityAh))
+					chargeAtLoss, formatRemainingTime(chargeAtLoss, smoothedAtLoss, cfg.BatteryCapacityAh))
 			} else {
 				// 3. Восстановление питания
 				duration := time.Since(lossTime)
@@ -652,6 +738,7 @@ func main() {
 				}
 				onBattery = false
 				notified = false
+				lowBatteryNotified = false
 			}
 		}
 
@@ -659,18 +746,51 @@ func main() {
 			continue
 		}
 
-		// 2. Уведомление в Telegram с задержкой (чтобы не спамить из-за коротких пропаданий)
+		// 2. Уведомление в Telegram с задержкой (чтобы не спамить из-за коротких пропаданий).
+		// Использует СНИМКИ (chargeAtLoss, smoothedAtLoss) из момента отключения,
+		// чтобы совпадать с логом (иначе EMA подстроится за DELAY_NOTIFY секунд).
 		if !notified && time.Since(lossTime).Seconds() >= cfg.DelayNotify {
-			notifier.Send(fmt.Sprintf("%s — Отключение электричества!\nЗаряд: %d%%, осталось ~%s.",
-				lossTime.Format("02.01.2006 15:04:05"), t.SOC,
-				formatRemainingTime(t.SOC, t.Current, cfg.BatteryCapacityAh)))
+			notifier.Send(fmt.Sprintf("%s — Отключение электричества!\nЗаряд: %d%%, осталось: %s.",
+				lossTime.Format("02.01.2006 15:04:05"), chargeAtLoss,
+				formatRemainingTime(chargeAtLoss, smoothedAtLoss, cfg.BatteryCapacityAh)))
 			notified = true
+		}
+
+		// 3. Предупреждение о низком заряде (разовое, до аварийного выключения)
+		if !lowBatteryNotified && t.SOC <= cfg.LowBatteryThreshold {
+			notifier.Send(fmt.Sprintf("%s — Низкий заряд: %d%%. Осталось ~%s.",
+				stamp(), t.SOC, formatRemainingTime(t.SOC, t.SmoothedCurrent, cfg.BatteryCapacityAh)))
+			lowBatteryNotified = true
 		}
 
 		// 4. Выключение ПК при критическом заряде
 		if t.SOC <= cfg.ShutdownThreshold {
 			doShutdown(fmt.Sprintf("Критический уровень заряда (%d%%), на батарее: %s.",
 				t.SOC, fmtDur(time.Since(lossTime))))
+		}
+
+		// 5. Предупреждение о высокой температуре (MOS / T1 / T2)
+		// Разовый алерт при превышении порога; повторно — только после отката
+		// всех датчиков ниже порога на TEMP_HYSTERESIS.
+		if !tempAlerted {
+			if t.Mos >= cfg.TempThreshold {
+				writeLog("Высокая температура MOS: %g°C.", t.Mos)
+				notifier.Send(fmt.Sprintf("%s — Высокая температура MOS: %g°C.", stamp(), t.Mos))
+				tempAlerted = true
+			}
+			if t.T1 >= cfg.TempThreshold {
+				writeLog("Высокая температура T1: %g°C.", t.T1)
+				notifier.Send(fmt.Sprintf("%s — Высокая температура T1: %g°C.", stamp(), t.T1))
+				tempAlerted = true
+			}
+			if t.T2 >= cfg.TempThreshold {
+				writeLog("Высокая температура T2: %g°C.", t.T2)
+				notifier.Send(fmt.Sprintf("%s — Высокая температура T2: %g°C.", stamp(), t.T2))
+				tempAlerted = true
+			}
+		} else if t.Mos < cfg.TempThreshold-cfg.TempHysteresis &&
+			t.T1 < cfg.TempThreshold-cfg.TempHysteresis && t.T2 < cfg.TempThreshold-cfg.TempHysteresis {
+			tempAlerted = false
 		}
 	}
 }
