@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -17,9 +16,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 
+	"golang.org/x/sys/windows"
 	"tinygo.org/x/bluetooth"
 )
 
@@ -149,7 +151,8 @@ func envNum(env map[string]string, key string, def, min float64) float64 {
 
 type Telemetry struct {
 	SOC             uint16
-	Current         float64 // мгновенный ток (А)
+	Voltage         float64 // напряжение сборки, В
+	Current         float64 // мгновенный ток (А): минус = разряд, плюс = заряд
 	SmoothedCurrent float64 // EMA-сглаженный ток (А), для расчёта оставшегося времени
 	Mos             float64 // температура MOS, °C
 	T1              float64 // температура датчика T1, °C
@@ -167,7 +170,7 @@ type BMSState struct {
 // 0.1 = вес нового значения 10%, за ~10 с подстраивается под реальное изменение.
 const emaAlpha = 0.1
 
-func (s *BMSState) update(soc uint16, current, mos, t1, t2 float64) {
+func (s *BMSState) update(soc uint16, voltage, current, mos, t1, t2 float64) {
 	s.mu.Lock()
 	// EMA: новое сглаженное = alpha * мгновенное + (1 - alpha) * предыдущее сглаженное
 	smoothed := s.t.SmoothedCurrent
@@ -176,7 +179,7 @@ func (s *BMSState) update(soc uint16, current, mos, t1, t2 float64) {
 	} else {
 		smoothed = emaAlpha*current + (1-emaAlpha)*smoothed
 	}
-	s.t = Telemetry{SOC: soc, Current: current, SmoothedCurrent: smoothed, Mos: mos, T1: t1, T2: t2, Valid: true, Updated: time.Now()}
+	s.t = Telemetry{SOC: soc, Voltage: voltage, Current: current, SmoothedCurrent: smoothed, Mos: mos, T1: t1, T2: t2, Valid: true, Updated: time.Now()}
 	s.mu.Unlock()
 }
 
@@ -245,11 +248,14 @@ func parseTelemetry(frame []byte, state *BMSState) {
 	// Ток разряда/заряда (int32 LE, 0.001 А), смещение 158
 	rawCurrent := int32(binary.LittleEndian.Uint32(frame[158:162]))
 
+	// Напряжение сборки (uint32 LE, 0.001 В), смещение 150 (118+32)
+	voltage := float64(binary.LittleEndian.Uint32(frame[150:154])) * 0.001
+
 	// Температуры (int16 LE, 0.1 °C): MOS 144:145, T1 162:163, T2 164:165
 	mos := float64(int16(binary.LittleEndian.Uint16(frame[144:146]))) * 0.1
 	t1 := float64(int16(binary.LittleEndian.Uint16(frame[162:164]))) * 0.1
 	t2 := float64(int16(binary.LittleEndian.Uint16(frame[164:166]))) * 0.1
-	state.update(uint16(soc), float64(rawCurrent)*0.001, mos, t1, t2)
+	state.update(uint16(soc), voltage, float64(rawCurrent)*0.001, mos, t1, t2)
 }
 
 // ---------- Telegram (асинхронно, с повторами) ----------
@@ -293,20 +299,18 @@ func (n *Notifier) worker() {
 }
 
 func (n *Notifier) post(text string) (retry bool, err error) {
-	data := url.Values{"chat_id": {n.chatID}, "text": {text}}
-	client := http.Client{Timeout: 10 * time.Second}
-	resp, err := client.PostForm("https://api.telegram.org/bot"+n.token+"/sendMessage", data)
+	body := url.Values{"chat_id": {n.chatID}, "text": {text}}.Encode()
+	code, err := winhttpPost("api.telegram.org", "/bot"+n.token+"/sendMessage", body)
 	if err != nil {
-		// текст ошибки содержит URL с токеном — вырезаем его
+		// ошибки WinHTTP не содержат URL (а значит, и токен), но на всякий случай вырезаем его
 		return true, errors.New(strings.ReplaceAll(err.Error(), n.token, "***"))
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusOK {
+	if code == 200 {
 		return false, nil
 	}
 	// 4xx (кроме 429) — ошибка настроек (токен/chat_id), повторять бессмысленно
-	permanent := resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests
-	return !permanent, fmt.Errorf("HTTP %d", resp.StatusCode)
+	permanent := code >= 400 && code < 500 && code != 429
+	return !permanent, fmt.Errorf("HTTP %d", code)
 }
 
 // ---------- BLE: подключение и автопереподключение ----------
@@ -552,13 +556,45 @@ func formatRemainingTime(soc uint16, smoothedCurrent, capacityAh float64) string
 	if smoothedCurrent >= dischargeLimit {
 		return "н/д"
 	}
-	hours := capacityAh * (float64(soc) / 100.0) / math.Abs(smoothedCurrent)
+	return fmtHM(capacityAh * (float64(soc) / 100.0) / math.Abs(smoothedCurrent))
+}
+
+// formatTimeToFull: время до полной зарядки по сглаженному току заряда (в том же стиле).
+// Оценка линейная: ближе к 100% BMS снижает ток (фаза CV), поэтому реальное время будет чуть больше.
+func formatTimeToFull(soc uint16, smoothedCurrent, capacityAh float64) string {
+	if soc >= 100 {
+		return "заряжена"
+	}
+	if smoothedCurrent <= -dischargeLimit { // заряжается слишком слабо (или не заряжается)
+		return "н/д"
+	}
+	return fmtHM(capacityAh * (float64(100-soc) / 100.0) / smoothedCurrent)
+}
+
+func fmtHM(hours float64) string {
 	h := int(hours)
 	m := int((hours - float64(h)) * 60)
 	if h > 0 {
 		return fmt.Sprintf("%d ч %d мин", h, m)
 	}
 	return fmt.Sprintf("%d мин", m)
+}
+
+// trayTooltip собирает текст тултипа (лимит Windows — 127 символов, наш максимум ~95).
+func trayTooltip(t Telemetry, onBattery bool, capacityAh float64) string {
+	var third string
+	switch {
+	case onBattery:
+		third = "Осталось: " + formatRemainingTime(t.SOC, t.SmoothedCurrent, capacityAh)
+	case t.SOC >= 100:
+		third = "Батарея заряжена"
+	case t.SmoothedCurrent > -dischargeLimit:
+		third = "До полной: " + formatTimeToFull(t.SOC, t.SmoothedCurrent, capacityAh)
+	default:
+		third = "Питание от сети"
+	}
+	return fmt.Sprintf("Заряд: %d%% · %.2f В\nТок: %+.2f А\n%s\nMOS %.1f · T1 %.1f · T2 %.1f °C",
+		t.SOC, t.Voltage, t.Current, third, t.Mos, t.T1, t.T2)
 }
 
 func fmtDur(d time.Duration) string {
@@ -568,18 +604,418 @@ func fmtDur(d time.Duration) string {
 
 func stamp() string { return time.Now().Format("02.01.2006 15:04:05") }
 
+// hiddenCmd запускает консольную утилиту без мелькающего окна (важно при сборке с -H windowsgui).
+func hiddenCmd(name string, args ...string) *exec.Cmd {
+	c := exec.Command(name, args...)
+	c.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000} // CREATE_NO_WINDOW
+	return c
+}
+
 func shutdownCmd(timeoutSec int) *exec.Cmd {
-	if runtime.GOOS == "windows" {
-		return exec.Command("shutdown", "/s", "/t", strconv.Itoa(timeoutSec))
-	}
-	return exec.Command("shutdown", "-h", fmt.Sprintf("+%d", (timeoutSec+59)/60))
+	return hiddenCmd("shutdown", "/s", "/t", strconv.Itoa(timeoutSec))
 }
 
 func abortShutdownCmd() *exec.Cmd {
-	if runtime.GOOS == "windows" {
-		return exec.Command("shutdown", "/a")
+	return hiddenCmd("shutdown", "/a")
+}
+
+// ---------- WinHTTP (вместо net/http: экономит ~3.5 МБ в exe) ----------
+
+var (
+	winhttp                 = windows.NewLazySystemDLL("winhttp.dll")
+	pWinHttpOpen            = winhttp.NewProc("WinHttpOpen")
+	pWinHttpSetTimeouts     = winhttp.NewProc("WinHttpSetTimeouts")
+	pWinHttpConnect         = winhttp.NewProc("WinHttpConnect")
+	pWinHttpOpenRequest     = winhttp.NewProc("WinHttpOpenRequest")
+	pWinHttpSendRequest     = winhttp.NewProc("WinHttpSendRequest")
+	pWinHttpReceiveResponse = winhttp.NewProc("WinHttpReceiveResponse")
+	pWinHttpQueryHeaders    = winhttp.NewProc("WinHttpQueryHeaders")
+	pWinHttpCloseHandle     = winhttp.NewProc("WinHttpCloseHandle")
+)
+
+// winhttpPost отправляет POST (form-urlencoded) по HTTPS и возвращает HTTP-статус.
+// Тексты ошибок не содержат path, поэтому токен в них не попадает.
+// Указатели передаются прямо в Call(...) — так их держит живыми //go:uintptrescapes.
+func winhttpPost(host, path, body string) (int, error) {
+	const (
+		accessAutoProxy = 4               // WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY (Win 8.1+)
+		flagSecure      = 0x00800000      // WINHTTP_FLAG_SECURE
+		queryStatus     = 19 | 0x20000000 // WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER
+		timeoutMs       = 10000
+	)
+	fail := func(name string, e error) (int, error) {
+		return 0, fmt.Errorf("%s: %v", name, e)
 	}
-	return exec.Command("shutdown", "-c")
+
+	agent, _ := windows.UTF16PtrFromString("ups-jk-bms-monitor")
+	hostP, _ := windows.UTF16PtrFromString(host)
+	verbP, _ := windows.UTF16PtrFromString("POST")
+	pathP, _ := windows.UTF16PtrFromString(path)
+	hdrP, _ := windows.UTF16PtrFromString("Content-Type: application/x-www-form-urlencoded")
+	b := []byte(body)
+	if len(b) == 0 {
+		return 0, errors.New("пустое тело запроса")
+	}
+
+	ses, _, e := pWinHttpOpen.Call(uintptr(unsafe.Pointer(agent)), accessAutoProxy, 0, 0, 0)
+	if ses == 0 {
+		return fail("WinHttpOpen", e)
+	}
+	defer pWinHttpCloseHandle.Call(ses)
+	pWinHttpSetTimeouts.Call(ses, timeoutMs, timeoutMs, timeoutMs, timeoutMs)
+
+	conn, _, e := pWinHttpConnect.Call(ses, uintptr(unsafe.Pointer(hostP)), 443, 0)
+	if conn == 0 {
+		return fail("WinHttpConnect", e)
+	}
+	defer pWinHttpCloseHandle.Call(conn)
+
+	req, _, e := pWinHttpOpenRequest.Call(conn, uintptr(unsafe.Pointer(verbP)), uintptr(unsafe.Pointer(pathP)), 0, 0, 0, flagSecure)
+	if req == 0 {
+		return fail("WinHttpOpenRequest", e)
+	}
+	defer pWinHttpCloseHandle.Call(req)
+
+	r, _, e := pWinHttpSendRequest.Call(req, uintptr(unsafe.Pointer(hdrP)), uintptr(^uint32(0)),
+		uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)), uintptr(len(b)), 0)
+	if r == 0 {
+		return fail("WinHttpSendRequest", e)
+	}
+	if r, _, e = pWinHttpReceiveResponse.Call(req, 0); r == 0 {
+		return fail("WinHttpReceiveResponse", e)
+	}
+
+	var status uint32
+	size := uint32(4)
+	if r, _, e = pWinHttpQueryHeaders.Call(req, queryStatus, 0,
+		uintptr(unsafe.Pointer(&status)), uintptr(unsafe.Pointer(&size)), 0); r == 0 {
+		return fail("WinHttpQueryHeaders", e)
+	}
+	return int(status), nil
+}
+
+// ---------- Иконка в трее (чистый Win32, без сторонних библиотек) ----------
+
+const (
+	colGreen  uint32 = 0xFF1E8E3E // питание от сети
+	colOrange uint32 = 0xFFE67700 // работа от батареи
+	colRed    uint32 = 0xFFC62828 // низкий заряд
+	colGray   uint32 = 0xFF666666 // нет связи с BMS
+)
+
+const (
+	wmCommand   = 0x0111
+	wmDestroy   = 0x0002
+	wmClose     = 0x0010
+	wmRButtonUp = 0x0205
+	wmTray      = 0x8001 // WM_APP+1: события от иконки
+	wmUpdate    = 0x8002 // WM_APP+2: перерисовать иконку
+	idExit      = 1001
+
+	nimAdd    = 0
+	nimModify = 1
+	nimDelete = 2
+
+	nifMessage = 1
+	nifIcon    = 2
+	nifTip     = 4
+)
+
+var (
+	user32  = windows.NewLazySystemDLL("user32.dll")
+	shell32 = windows.NewLazySystemDLL("shell32.dll")
+	gdi32   = windows.NewLazySystemDLL("gdi32.dll")
+
+	pRegisterClassEx  = user32.NewProc("RegisterClassExW")
+	pCreateWindowEx   = user32.NewProc("CreateWindowExW")
+	pDefWindowProc    = user32.NewProc("DefWindowProcW")
+	pDestroyWindow    = user32.NewProc("DestroyWindow")
+	pGetMessage       = user32.NewProc("GetMessageW")
+	pTranslateMessage = user32.NewProc("TranslateMessage")
+	pDispatchMessage  = user32.NewProc("DispatchMessageW")
+	pPostMessage      = user32.NewProc("PostMessageW")
+	pPostQuitMessage  = user32.NewProc("PostQuitMessage")
+	pRegisterWinMsg   = user32.NewProc("RegisterWindowMessageW")
+	pCreateIconInd    = user32.NewProc("CreateIconIndirect")
+	pDestroyIcon      = user32.NewProc("DestroyIcon")
+	pGetSystemMetrics = user32.NewProc("GetSystemMetrics")
+	pCreatePopupMenu  = user32.NewProc("CreatePopupMenu")
+	pAppendMenu       = user32.NewProc("AppendMenuW")
+	pTrackPopupMenu   = user32.NewProc("TrackPopupMenu")
+	pDestroyMenu      = user32.NewProc("DestroyMenu")
+	pGetCursorPos     = user32.NewProc("GetCursorPos")
+	pSetForegroundWnd = user32.NewProc("SetForegroundWindow")
+	pShellNotifyIcon  = shell32.NewProc("Shell_NotifyIconW")
+	pCreateBitmap     = gdi32.NewProc("CreateBitmap")
+	pDeleteObject     = gdi32.NewProc("DeleteObject")
+)
+
+type wndClassEx struct {
+	cbSize, style                      uint32
+	lpfnWndProc                        uintptr
+	cbClsExtra, cbWndExtra             int32
+	hInstance, hIcon, hCursor, hbrBack uintptr
+	lpszMenuName, lpszClassName        *uint16
+	hIconSm                            uintptr
+}
+
+type point struct{ x, y int32 }
+
+type winMsg struct {
+	hwnd    uintptr
+	message uint32
+	wParam  uintptr
+	lParam  uintptr
+	time    uint32
+	pt      point
+}
+
+type iconInfo struct {
+	fIcon              uint32
+	xHotspot, yHotspot uint32
+	hbmMask, hbmColor  uintptr
+}
+
+type notifyIconData struct {
+	cbSize           uint32
+	hWnd             uintptr
+	uID, uFlags      uint32
+	uCallbackMessage uint32
+	hIcon            uintptr
+	szTip            [128]uint16
+	dwState, dwMask  uint32
+	szInfo           [256]uint16
+	uTimeout         uint32
+	szInfoTitle      [64]uint16
+	dwInfoFlags      uint32
+	guidItem         windows.GUID
+	hBalloonIcon     uintptr
+}
+
+// Шрифт 3×5, 15 бит на цифру, старший бит = левый верхний пиксель.
+var digitFont = [10]uint16{
+	0x7B6F, 0x2C97, 0x73E7, 0x73CF, 0x5BC9,
+	0x79CF, 0x79EF, 0x7249, 0x7BEF, 0x7BCF,
+}
+
+type trayState struct {
+	soc   int
+	color uint32
+	tip   string
+}
+
+var (
+	trayMu       sync.Mutex
+	trayCur      = trayState{soc: -1, color: colGray, tip: "ups-jk-bms-monitor: ожидание данных..."}
+	trayLastPost time.Time
+	trayHwnd     atomic.Uintptr
+	trayDone     = make(chan struct{})
+
+	// используются только в потоке трея
+	taskbarCreated uint32
+	prevIcon       uintptr
+	iconSOC        = -2
+	iconColor      uint32
+	onTrayExit     func()
+)
+
+// trayUpdate можно вызывать из любой горутины. Лишние вызовы отбрасываются:
+// иконка перерисовывается при смене процента/цвета, тултип обновляется не чаще раза в 5 с.
+func trayUpdate(soc int, color uint32, tip string) {
+	trayMu.Lock()
+	changed := soc != trayCur.soc || color != trayCur.color
+	if !changed && time.Since(trayLastPost) < 5*time.Second {
+		trayMu.Unlock()
+		return
+	}
+	trayCur = trayState{soc, color, tip}
+	trayLastPost = time.Now()
+	trayMu.Unlock()
+	if h := trayHwnd.Load(); h != 0 {
+		pPostMessage.Call(h, wmUpdate, 0, 0)
+	}
+}
+
+// trayStop убирает иконку и ждёт завершения потока трея (чтобы не осталась «призрачная» иконка).
+func trayStop() {
+	if h := trayHwnd.Load(); h != 0 {
+		pPostMessage.Call(h, wmClose, 0, 0)
+		select {
+		case <-trayDone:
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+func makeIcon(soc int, bg uint32) uintptr {
+	sz := 16
+	if v, _, _ := pGetSystemMetrics.Call(49); v > 0 { // SM_CXSMICON (учитывает DPI)
+		sz = int(v)
+	}
+	px := make([]uint32, sz*sz)
+	for i := range px {
+		px[i] = bg
+	}
+	text := "--"
+	if soc >= 0 {
+		text = strconv.Itoa(soc)
+	}
+	n := len(text)
+	k := sz / (4*n - 1) // масштаб «пикселя» шрифта
+	if m := (sz - 2) / 5; k > m {
+		k = m
+	}
+	if k < 1 {
+		k = 1
+	}
+	w, h := (4*n-1)*k, 5*k
+	x0, y0 := (sz-w)/2, (sz-h)/2
+	for i := 0; i < n; i++ {
+		if text[i] < '0' || text[i] > '9' { // «-»: горизонтальная черта
+			for dx := 0; dx < 3*k; dx++ {
+				for dy := 0; dy < k; dy++ {
+					px[(y0+2*k+dy)*sz+x0+i*4*k+dx] = 0xFFFFFFFF
+				}
+			}
+			continue
+		}
+		g := digitFont[text[i]-'0']
+		for r := 0; r < 5; r++ {
+			for c := 0; c < 3; c++ {
+				if g&(1<<uint(14-(r*3+c))) == 0 {
+					continue
+				}
+				for dy := 0; dy < k; dy++ {
+					for dx := 0; dx < k; dx++ {
+						px[(y0+r*k+dy)*sz+x0+(i*4+c)*k+dx] = 0xFFFFFFFF
+					}
+				}
+			}
+		}
+	}
+	color, _, _ := pCreateBitmap.Call(uintptr(sz), uintptr(sz), 1, 32, uintptr(unsafe.Pointer(&px[0])))
+	mask, _, _ := pCreateBitmap.Call(uintptr(sz), uintptr(sz), 1, 1, 0)
+	ii := iconInfo{fIcon: 1, hbmMask: mask, hbmColor: color}
+	hIcon, _, _ := pCreateIconInd.Call(uintptr(unsafe.Pointer(&ii)))
+	pDeleteObject.Call(color)
+	pDeleteObject.Call(mask)
+	return hIcon
+}
+
+func applyIcon(hwnd uintptr, op uintptr) {
+	trayMu.Lock()
+	s := trayCur
+	trayMu.Unlock()
+
+	// Иконку пересоздаём только если изменились цифры/цвет
+	if s.soc != iconSOC || s.color != iconColor || prevIcon == 0 {
+		old := prevIcon
+		prevIcon = makeIcon(s.soc, s.color)
+		iconSOC, iconColor = s.soc, s.color
+		defer func() {
+			if old != 0 {
+				pDestroyIcon.Call(old)
+			}
+		}()
+	}
+
+	nid := notifyIconData{hWnd: hwnd, uID: 1, uFlags: nifMessage | nifIcon | nifTip,
+		uCallbackMessage: wmTray, hIcon: prevIcon}
+	nid.cbSize = uint32(unsafe.Sizeof(nid))
+	if u, err := windows.UTF16FromString(s.tip); err == nil {
+		if len(u) > 127 {
+			u = u[:127]
+		}
+		copy(nid.szTip[:], u)
+	}
+	pShellNotifyIcon.Call(op, uintptr(unsafe.Pointer(&nid)))
+}
+
+func showMenu(hwnd uintptr) {
+	menu, _, _ := pCreatePopupMenu.Call()
+	text, _ := windows.UTF16PtrFromString("Выход")
+	pAppendMenu.Call(menu, 0, idExit, uintptr(unsafe.Pointer(text)))
+	var p point
+	pGetCursorPos.Call(uintptr(unsafe.Pointer(&p)))
+	pSetForegroundWnd.Call(hwnd) // иначе меню не закроется кликом мимо
+	pTrackPopupMenu.Call(menu, 0x20|0x2, uintptr(p.x), uintptr(p.y), 0, hwnd, 0)
+	pPostMessage.Call(hwnd, 0, 0, 0) // WM_NULL
+	pDestroyMenu.Call(menu)
+}
+
+func wndProc(hwnd, msg, wp, lp uintptr) uintptr {
+	if taskbarCreated != 0 && uint32(msg) == taskbarCreated { // Explorer перезапустился
+		applyIcon(hwnd, nimAdd)
+		return 0
+	}
+	switch msg {
+	case wmTray:
+		if lp == wmRButtonUp {
+			showMenu(hwnd)
+		}
+		return 0
+	case wmUpdate:
+		applyIcon(hwnd, nimModify)
+		return 0
+	case wmCommand:
+		if wp&0xFFFF == idExit {
+			pDestroyWindow.Call(hwnd)
+			if onTrayExit != nil {
+				onTrayExit()
+			}
+		}
+		return 0
+	case wmDestroy:
+		nid := notifyIconData{hWnd: hwnd, uID: 1}
+		nid.cbSize = uint32(unsafe.Sizeof(nid))
+		pShellNotifyIcon.Call(nimDelete, uintptr(unsafe.Pointer(&nid)))
+		if prevIcon != 0 {
+			pDestroyIcon.Call(prevIcon)
+			prevIcon = 0
+		}
+		pPostQuitMessage.Call(0)
+		return 0
+	}
+	r, _, _ := pDefWindowProc.Call(hwnd, msg, wp, lp)
+	return r
+}
+
+// runTray запускается в отдельной горутине: go runTray(func(){...}).
+// Поток блокируется в GetMessage — в простое CPU не потребляет.
+func runTray(onExit func()) {
+	runtime.LockOSThread()
+	defer close(trayDone)
+	onTrayExit = onExit
+
+	name, _ := windows.UTF16PtrFromString("UPSJKBMSTray")
+	tb, _ := windows.UTF16PtrFromString("TaskbarCreated")
+	r, _, _ := pRegisterWinMsg.Call(uintptr(unsafe.Pointer(tb)))
+	taskbarCreated = uint32(r)
+
+	var hInst windows.Handle
+	_ = windows.GetModuleHandleEx(0, nil, &hInst)
+	wc := wndClassEx{lpfnWndProc: syscall.NewCallback(wndProc), hInstance: uintptr(hInst), lpszClassName: name}
+	wc.cbSize = uint32(unsafe.Sizeof(wc))
+	pRegisterClassEx.Call(uintptr(unsafe.Pointer(&wc)))
+
+	// Обычное скрытое окно (не message-only), иначе не придёт TaskbarCreated
+	hwnd, _, _ := pCreateWindowEx.Call(0, uintptr(unsafe.Pointer(name)), uintptr(unsafe.Pointer(name)),
+		0, 0, 0, 0, 0, 0, 0, uintptr(hInst), 0)
+	if hwnd == 0 {
+		return
+	}
+	applyIcon(hwnd, nimAdd)
+	trayHwnd.Store(hwnd)
+
+	var m winMsg
+	for {
+		r, _, _ := pGetMessage.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
+		if int32(r) <= 0 {
+			break
+		}
+		pTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
+		pDispatchMessage.Call(uintptr(unsafe.Pointer(&m)))
+	}
 }
 
 // ---------- main ----------
@@ -628,6 +1064,14 @@ func main() {
 	done := make(chan struct{})
 	go bmsLoop(cfg, &state, stop, done)
 
+	quit := make(chan struct{}, 1) // выход из меню трея
+	go runTray(func() {
+		select {
+		case quit <- struct{}{}:
+		default:
+		}
+	})
+
 	var (
 		onBattery          bool // подтверждённое состояние (с антидребезгом)
 		pending            int  // сколько тиков подряд наблюдается противоположное состояние
@@ -663,16 +1107,24 @@ func main() {
 	defer ticker.Stop()
 
 	for {
+		exiting := false
 		select {
 		case <-sigChan:
 			writeLog("Получен сигнал завершения. Остановка службы...")
+			exiting = true
+		case <-quit:
+			writeLog("Выход из меню трея. Остановка службы...")
+			exiting = true
+		case <-ticker.C:
+		}
+		if exiting {
 			close(stop)
 			select {
 			case <-done:
 			case <-time.After(5 * time.Second):
 			}
+			trayStop()
 			return
-		case <-ticker.C:
 		}
 
 		t := state.get()
@@ -687,6 +1139,7 @@ func main() {
 				stale = true
 				writeLog("Нет данных от BMS более %d с, идёт переподключение...", int(staleAfter.Seconds()))
 			}
+			trayUpdate(-1, colGray, "Нет связи с BMS")
 			// Страховка: на батарее и связи с BMS нет — не ждём, пока батарея сядет «вслепую»
 			if onBattery && cfg.StaleShutdown > 0 && age > time.Duration(cfg.StaleShutdown)*time.Second {
 				doShutdown(fmt.Sprintf("Связь с BMS потеряна на %d с при работе от батареи (последний заряд: %d%%).",
@@ -741,6 +1194,16 @@ func main() {
 				lowBatteryNotified = false
 			}
 		}
+
+		// Иконка в трее: цвет и процент заряда, в тултипе — подробности
+		trayCol := colGreen
+		if onBattery {
+			trayCol = colOrange
+			if t.SOC <= cfg.LowBatteryThreshold {
+				trayCol = colRed
+			}
+		}
+		trayUpdate(int(t.SOC), trayCol, trayTooltip(t, onBattery, cfg.BatteryCapacityAh))
 
 		if !onBattery {
 			continue

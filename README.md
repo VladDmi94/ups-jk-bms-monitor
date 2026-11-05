@@ -67,8 +67,7 @@ go run main.go
 ### Сборка `.exe` файла
 
 ```bash
-go build -ldflags="-s -w" -o ups-jk-bms-monitor.exe main.go
-go build -ldflags="-s -w -H windowsgui" -o ups-jk-bms-monitor.exe .
+go build -trimpath -ldflags="-s -w -H windowsgui" -o ups-jk-bms-monitor.exe .
 
 ```
 
