@@ -580,21 +580,26 @@ func fmtHM(hours float64) string {
 	return fmt.Sprintf("%d мин", m)
 }
 
-// trayTooltip собирает текст тултипа (лимит Windows — 127 символов, наш максимум ~95).
-func trayTooltip(t Telemetry, onBattery bool, capacityAh float64) string {
+// trayTooltip собирает текст тултипа (лимит Windows — 127 символов, наш максимум ~100).
+// Если тока практически нет (|I| < 0.1 А), строки «Ток» и «Осталось/До полной» не показываются.
+func trayTooltip(t Telemetry, capacityAh float64) string {
+	head := fmt.Sprintf("Заряд: %d%% · %.2f В", t.SOC, t.Voltage)
+	temps := fmt.Sprintf("MOS %.1f · T1 %.1f · T2 %.1f °C", t.Mos, t.T1, t.T2)
+	if math.Abs(t.Current) < -dischargeLimit {
+		return head + "\n" + temps
+	}
+
 	var third string
 	switch {
-	case onBattery:
+	case t.Current < 0:
 		third = "Осталось: " + formatRemainingTime(t.SOC, t.SmoothedCurrent, capacityAh)
 	case t.SOC >= 100:
 		third = "Батарея заряжена"
-	case t.SmoothedCurrent > -dischargeLimit:
-		third = "До полной: " + formatTimeToFull(t.SOC, t.SmoothedCurrent, capacityAh)
 	default:
-		third = "Питание от сети"
+		third = "До полной: " + formatTimeToFull(t.SOC, t.SmoothedCurrent, capacityAh)
 	}
-	return fmt.Sprintf("Заряд: %d%% · %.2f В\nТок: %+.2f А\n%s\nMOS %.1f · T1 %.1f · T2 %.1f °C",
-		t.SOC, t.Voltage, t.Current, third, t.Mos, t.T1, t.T2)
+	power := math.Abs(t.Voltage * t.Current)
+	return fmt.Sprintf("%s\nТок: %+.2f А · %.2f W\n%s\n%s", head, t.Current, power, third, temps)
 }
 
 func fmtDur(d time.Duration) string {
@@ -1203,7 +1208,7 @@ func main() {
 				trayCol = colRed
 			}
 		}
-		trayUpdate(int(t.SOC), trayCol, trayTooltip(t, onBattery, cfg.BatteryCapacityAh))
+		trayUpdate(int(t.SOC), trayCol, trayTooltip(t, cfg.BatteryCapacityAh))
 
 		if !onBattery {
 			continue
