@@ -1091,7 +1091,8 @@ func main() {
 		tempAlerted        bool // предупреждение о температуре уже отправлено (сработает повторно после отката ниже порога)
 	)
 
-	doShutdown := func(reason string) {
+	// reason — строка для лога; tgTitle/tgBody — заголовок и текст сообщения в Telegram.
+	doShutdown := func(reason, tgTitle, tgBody string) {
 		if shutdownStarted || time.Now().Before(nextShutdownTry) {
 			return
 		}
@@ -1102,7 +1103,7 @@ func main() {
 			return
 		}
 		shutdownStarted = true
-		notifier.Send(fmt.Sprintf("%s — Выключение ПК!\n%s", stamp(), reason))
+		notifier.Send(fmt.Sprintf("%s — %s\n%s", stamp(), tgTitle, tgBody))
 	}
 
 	sigChan := make(chan os.Signal, 1)
@@ -1147,8 +1148,9 @@ func main() {
 			trayUpdate(-1, colGray, "Нет связи с BMS")
 			// Страховка: на батарее и связи с BMS нет — не ждём, пока батарея сядет «вслепую»
 			if onBattery && cfg.StaleShutdown > 0 && age > time.Duration(cfg.StaleShutdown)*time.Second {
-				doShutdown(fmt.Sprintf("Связь с BMS потеряна на %d с при работе от батареи (последний заряд: %d%%).",
-					int(age.Seconds()), t.SOC))
+				reason := fmt.Sprintf("Связь с BMS потеряна на %d с при работе от батареи (последний заряд: %d%%).",
+					int(age.Seconds()), t.SOC)
+				doShutdown(reason, "Выключение ПК!", reason)
 			}
 			continue
 		}
@@ -1226,15 +1228,18 @@ func main() {
 
 		// 3. Предупреждение о низком заряде (разовое, до аварийного выключения)
 		if !lowBatteryNotified && t.SOC <= cfg.LowBatteryThreshold {
-			notifier.Send(fmt.Sprintf("%s — Низкий заряд: %d%%. Осталось ~%s.",
+			notifier.Send(fmt.Sprintf("%s — Низкий уровень!\nЗаряд: %d%%, осталось: %s.",
 				stamp(), t.SOC, formatRemainingTime(t.SOC, t.SmoothedCurrent, cfg.BatteryCapacityAh)))
 			lowBatteryNotified = true
 		}
 
 		// 4. Выключение ПК при критическом заряде
 		if t.SOC <= cfg.ShutdownThreshold {
-			doShutdown(fmt.Sprintf("Критический уровень заряда (%d%%), на батарее: %s.",
-				t.SOC, fmtDur(time.Since(lossTime))))
+			onBatt := fmtDur(time.Since(lossTime))
+			doShutdown(
+				fmt.Sprintf("Критический уровень заряда (%d%%), на батарее: %s.", t.SOC, onBatt),
+				"Критический уровень! Выключение ПК!",
+				fmt.Sprintf("Заряд: %d%%, прошло: %s.", t.SOC, onBatt))
 		}
 
 		// 5. Предупреждение о высокой температуре (MOS / T1 / T2)
