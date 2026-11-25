@@ -47,7 +47,7 @@ SHUTDOWN_THRESHOLD=5      # Порог SOC (%) для аварийного вы�
 LOW_BATTERY_THRESHOLD=20  # Порог SOC (%) для предупреждения о низком заряде в Telegram
 SHUTDOWN_TIMEOUT=30       # Тайм-аут перед выключением Windows (в секундах)
 STALE_SHUTDOWN=0          # Тайм-аут потери связи с BMS (с) для завершения работы (0 - не отключать ПК)
-TEMP_THRESHOLD=69         # Порог температуры (°C) для предупреждения в Telegram
+TEMP_THRESHOLD=65         # Порог температуры (°C) для предупреждения в Telegram
 TEMP_HYSTERESIS=5         # Откат (°C) ниже порога, после которого алерт может повториться
 LOG_FILE=ups_log.txt
 

@@ -1054,7 +1054,7 @@ func main() {
 		LowBatteryThreshold: uint16(envNum(env, "LOW_BATTERY_THRESHOLD", 20, 1)),
 		ShutdownTimeout:     int(envNum(env, "SHUTDOWN_TIMEOUT", 30, 1)),
 		StaleShutdown:       int(envNum(env, "STALE_SHUTDOWN", 0, 0)),
-		TempThreshold:       envNum(env, "TEMP_THRESHOLD", 69, 0),
+		TempThreshold:       envNum(env, "TEMP_THRESHOLD", 65, 0),
 		TempHysteresis:      envNum(env, "TEMP_HYSTERESIS", 5, 0),
 	}
 	if cfg.ShutdownThreshold > 100 {
